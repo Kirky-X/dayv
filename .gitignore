@@ -37,3 +37,7 @@ Thumbs.db
 
 # 日志
 *.log
+
+
+# Darwin skill 优化产物（开发期使用，不入仓库）
+test-prompts.json
