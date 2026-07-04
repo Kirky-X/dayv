@@ -1,0 +1,39 @@
+# Specmark 工作流产物（开发期使用，不入仓库）
+specmark/
+
+# 测试代码（开发期使用，不入仓库）
+tests/
+**/tests/
+**/test/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 日志
+*.log
