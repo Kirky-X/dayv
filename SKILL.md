@@ -14,11 +14,14 @@ license: MIT
 ```
 用户意图
 ├─ 分析某个项目的依赖树/冲突/漏洞   → analyze <project_path>
+│     · --visualize --depth N: 渲染 Mermaid 依赖树
+│     · --impact: 分析冲突影响范围（受影响包 + 依赖链）
 ├─ 查询某个包的详情（版本/依赖/许可证）→ query <pkg> [-e <ecosystem>]
 ├─ 按关键词搜索包                    → search <keyword> [-e <ecosystem>]
 ├─ 检查某个包的安全漏洞              → security <pkg>
 ├─ 从 deps_data.json 生成完整报告    → report <deps_data.json> [--format json|html|pdf|sbom] [-o <file>]
-└─ 评估项目依赖健康度（5 维度评分）   → health <project_path> [-o <file>]
+├─ 评估项目依赖健康度（5 维度评分）   → health <project_path> [-o <file>]
+└─ 生成项目依赖 README 章节（markdown）→ readme <project_path> [-o <file>]
 ```
 
 支持 7 个生态系统：Python(pypi) / Node.js(npm) / Java(maven) / Rust(crates) / Ruby(rubygems) / PHP(packagist) / .NET(nuget)。Go 和 C/C++ 不支持（无中央 registry）。
@@ -31,12 +34,13 @@ license: MIT
 
 | Subcommand | 说明                   | 使用场景                       |
 | ---------- | ---------------------- | ------------------------------ |
-| `analyze`  | 分析项目依赖           | 分析项目的依赖树和依赖关系     |
+| `analyze`  | 分析项目依赖           | 分析项目的依赖树和依赖关系（含 `--visualize` Mermaid 可视化、`--impact` 冲突影响范围） |
 | `query`    | 查询包依赖             | 查询某个包的上下游依赖         |
 | `search`   | 搜索包                 | 搜索包信息                     |
 | `security` | 检查安全漏洞           | 扫描包的安全漏洞               |
 | `report`   | 生成完整报告           | 生成 JSON/HTML/PDF/SBOM 格式的分析报告 |
 | `health`   | 依赖健康度评分         | 评估项目依赖健康度（5 维度评分 + 雷达图 + 改进建议） |
+| `readme`   | 生成依赖 README 章节   | 从依赖列表生成 markdown 依赖说明章节（按 ecosystem 分组 + 表格） |
 
 ---
 
@@ -96,6 +100,29 @@ python scripts/dependency_analyzer.py health /path/to/project -o health.json
   # 输出: 总分(0-100) + 5 维度评分 + 改进建议 + Mermaid 雷达图
   # 阈值: >=70 healthy, 50-69 warning, <50 danger
   # 维度: 版本新旧(0.2) / 漏洞状态(0.3) / 维护状态(0.15) / 依赖稳定(0.2) / 许可证合规(0.15)
+
+# 渲染 Mermaid 依赖树（可视化依赖关系）
+python scripts/dependency_analyzer.py analyze /path/to/project --visualize
+python scripts/dependency_analyzer.py analyze /path/to/project --visualize --depth 5 -o tree.mmd
+  # 输出: ```mermaid flowchart TD``` 代码块（可在 markdown 渲染）
+  # 节点: P0["name@version"] / 边: P0 --> P1
+  # --depth N: 控制渲染层级（默认 3，从根出发的依赖层数）
+  # 循环依赖: 标注 %% CIRCULAR DETECTED 并停止该分支
+
+# 冲突影响范围分析（反向追溯受影响包 + 依赖链）
+python scripts/dependency_analyzer.py analyze /path/to/project --impact
+python scripts/dependency_analyzer.py analyze /path/to/project --impact -o impact.json
+  # 输出: 每个冲突的 conflict_package + required_versions + affected_packages + dependency_chains
+  # BFS 反向追溯: 从冲突包出发找所有依赖它的包
+  # 依赖链: 从根到冲突包的所有路径（DFS 带环检测）
+
+# 生成项目依赖 README 章节（markdown 表格）
+python scripts/dependency_analyzer.py readme /path/to/project
+python scripts/dependency_analyzer.py readme /path/to/project -o DEPS.md
+  # 输出: ## 依赖说明 章节，按 ecosystem 分组（PyPI/npm/Maven/...）
+  # 每组一个 markdown 表格: 包名 | 版本 | 用途 | 许可证
+  # 用途/许可证通过 subprocess 调 ecosystem 脚本（pypi.py/npm.py/...）查询
+  # 查询失败时显示占位符 "-"，不崩溃
 ```
 
 ---
@@ -172,6 +199,61 @@ python scripts/dependency_analyzer.py health /path/to/project -o health.json
 - **阈值**: `>=70` healthy / `50-69` warning / `<50` danger
 - **输出**: 总分 + 5 维度 ASCII 进度条 + 改进建议（针对最低分维度）+ Mermaid 雷达图
 - 复用 `health_scorer.score_health(report_dict)` + `health_scorer.render_radar_mermaid(result)`
+
+### 8. Mermaid 依赖树可视化
+
+`analyze --visualize [--depth N]` 渲染依赖树为 Mermaid flowchart：
+- **方向**: TD（top-down）
+- **节点**: `P0["name@version"]`（节点 ID 用 P{index} 序号分配，避免重名 + Mermaid 非法字符）
+- **边**: `P0 --> P1` 表示 A 依赖 B
+- **深度控制**: `--depth N`（默认 3），从根出发的依赖层数；超出深度的节点不渲染
+- **循环依赖检测**: 检测到环时标注 `%% CIRCULAR DETECTED: a --> b` 并停止该分支（不无限循环）
+- **根节点识别**: 优先 `is_root=True`，否则入度为 0 的包，否则全部当根
+- **输出**: stdout（默认）或 `-o file.mmd` 写文件
+- 复用 `visualizer.render_mermaid_tree(deps_data, depth=3)`
+
+### 9. 冲突影响范围分析
+
+`analyze --impact` 分析版本冲突的受影响范围：
+- **输入**: 依赖图 + `detect_conflicts()` 输出的冲突列表
+- **输出**: 每个冲突的影响范围 dict
+  ```
+  {
+    conflict_package: str,            # 冲突包名
+    required_versions: list[dict],    # 版本要求 [{package, constraint}]
+    affected_packages: list[str],     # 反向追溯到的所有依赖者（不含冲突包本身）
+    dependency_chains: list[list[str]]# 从根到冲突包的所有路径
+  }
+  ```
+- **BFS 反向遍历**: 从冲突包出发，沿反向边找出所有传递依赖它的包
+- **DFS 路径搜索**: 找从根到冲突包的所有路径（带环检测，避免无限循环）
+- **防爆炸**: `MAX_AFFECTED_PACKAGES=1000` / `MAX_CHAINS=50` / `MAX_CHAIN_LENGTH=50`
+- **输出格式**: 文本（默认，含受影响包列表 + 依赖链路径）或 `-o file.json`（JSON）
+- 复用 `impact_analyzer.analyze_conflict_impact(deps_data, conflicts)` + `impact_analyzer.format_impact_report(impacts)`
+
+### 10. 项目依赖 README 生成
+
+`readme <project_path>` 生成可插入项目 README 的"依赖说明"章节：
+- **章节结构**:
+  ```markdown
+  ## 依赖说明
+
+  ### PyPI (3 个)
+
+  | 包名 | 版本 | 用途 | 许可证 |
+  |------|------|------|--------|
+  | requests | 2.28.0 | HTTP library | Apache-2.0 |
+
+  ### npm (2 个)
+  ...
+  ```
+- **按 ecosystem 分组**: 7 个已知 ecosystem 按固定顺序（PyPI/npm/Maven/crates/RubyGems/Packagist/NuGet），未知 ecosystem 排最后
+- **用途/许可证查询**: 通过 `EcosystemFetcher` 用 subprocess 调用对应 ecosystem 脚本（`pypi.py`/`npm.py`/...）获取 `description` 和 `license`
+- **容错**: 查询失败/超时/解析错误时显示占位符 `-`，不崩溃（Rule 12 显性化：不静默吞错）
+- **根包排除**: `is_root=True` 的包不进入依赖表格（项目本身不是依赖）
+- **缓存**: `EcosystemFetcher` 内置 dict 缓存，避免重复查询同一包
+- **输出**: stdout（默认）或 `-o DEPS.md` 写文件
+- 复用 `readme_generator.generate_dependency_readme(deps_data, fetcher=...)`
 
 ---
 
@@ -314,6 +396,9 @@ xychart-beta
 | report_renderer.py    | HTML/PDF/JSON 报告渲染器      | `render_report(report, output, fmt)` | 被 `report --format` 调用 |
 | health_scorer.py      | 依赖健康度评分（5 维度）      | `score_health(report_dict)` / `render_radar_mermaid(result)` | 被 `health` 子命令调用 |
 | sbom_generator.py     | SPDX 2.3 SBOM 生成器          | `write_sbom(packages, edges, project_name, output)` | 被 `report --format sbom` 调用 |
+| visualizer.py         | Mermaid 依赖树可视化          | `render_mermaid_tree(deps_data, depth=3)` | 被 `analyze --visualize` 调用 |
+| impact_analyzer.py    | 冲突影响范围分析              | `analyze_conflict_impact(deps_data, conflicts)` / `format_impact_report(impacts)` | 被 `analyze --impact` 调用 |
+| readme_generator.py   | 项目依赖 README 生成器        | `generate_dependency_readme(deps_data, fetcher=None)` + `EcosystemFetcher` | 被 `readme` 子命令调用 |
 | pypi.py               | PyPI 包信息获取               | `get_package(name)` / `search_packages(keyword)` | `python pypi.py <package>` 或 `python pypi.py --search <keyword>` |
 | npm.py                | npm 包信息获取                | `get_package(name)` / `search_packages(keyword)` | `python npm.py <package>` 或 `python npm.py --search <keyword>` |
 | maven.py              | Maven 包信息获取              | `get_package(group:artifact)` | `python maven.py <groupId>:<artifactId>` |
@@ -379,16 +464,22 @@ xychart-beta
 - `scripts/tests/test_report_renderer.py` — HTML/PDF/JSON 渲染契约（11 个测试）
 - `scripts/tests/test_health_scorer.py` — 5 维度评分逻辑（14 个测试）
 - `scripts/tests/test_sbom_generator.py` — SPDX 2.3 schema 完整性（18 个测试）
+- `scripts/tests/test_visualizer.py` — Mermaid 依赖树渲染 + 深度控制 + 循环检测（13 个测试）
+- `scripts/tests/test_readme_generator.py` — README 生成 + ecosystem 分组 + fetcher 注入（13 个测试）
+- `scripts/tests/test_impact_analyzer.py` — 冲突影响范围 + BFS 反向追溯 + 依赖链（10 个测试）
 
 验证步骤：
-1. `python -m py_compile scripts/*.py` — 12 个脚本语法检查（含 3 个新模块）
+1. `python -m py_compile scripts/*.py` — 15 个脚本语法检查（含 3 个新模块）
 2. `python scripts/dependency_analyzer.py query numpy` — 验证 PyPI 查询链路
 3. `python scripts/dependency_analyzer.py security requests` — 验证漏洞扫描链路
 4. `python scripts/dependency_analyzer.py report deps_data.json --format html -o r.html` — 验证 HTML 报告
 5. `python scripts/dependency_analyzer.py report deps_data.json --format sbom -o r.spdx.json` — 验证 SBOM
 6. `python scripts/dependency_analyzer.py health /path/to/project` — 验证健康度评分
-7. `python -m pytest scripts/tests/ tests/ -v` — 跑全部单元测试（79 个）
-8. 检查输出是否符合 `Output Example` 章节的 schema
+7. `python scripts/dependency_analyzer.py analyze /path/to/project --visualize` — 验证 Mermaid 依赖树
+8. `python scripts/dependency_analyzer.py analyze /path/to/project --impact` — 验证冲突影响分析
+9. `python scripts/dependency_analyzer.py readme /path/to/project` — 验证依赖 README 生成
+10. `python -m pytest scripts/tests/ tests/ -v` — 跑全部单元测试（115 个 = 79 原 + 36 新）
+11. 检查输出是否符合 `Output Example` 章节的 schema
 
 ## Dependencies
 

@@ -1366,10 +1366,39 @@ def cmd_analyze_data(args):
             logger.error(f"关闭分析器时出错: {e}")
 
 
+def _to_deps_data(packages: List[DependencyNode],
+                  edges: List[DependencyEdge]) -> dict:
+    """
+    将 DependencyNode/Edge 列表转为 deps_data dict schema
+
+    用于 visualizer / readme_generator / impact_analyzer 等模块的输入
+    （与 cmd_report 输入的 deps_data.json schema 一致）
+    """
+    return {
+        "packages": [
+            {
+                "name": p.name,
+                "version": p.version,
+                "ecosystem": p.ecosystem,
+                "is_root": p.is_root,
+            }
+            for p in packages
+        ],
+        "edges": [
+            {
+                "source": e.source,
+                "target": e.target,
+                "constraint": e.constraint,
+            }
+            for e in edges
+        ],
+    }
+
+
 def cmd_analyze(args):
     """分析项目依赖"""
     project_path = args.project
-    
+
     logger.info(f"正在分析项目: {project_path}")
     
     # 智能解析项目依赖
@@ -1383,34 +1412,78 @@ def cmd_analyze(args):
     try:
         # 构建依赖图
         analyzer.build_dependency_graph(packages, edges)
-        
+
+        # 可视化依赖树（Mermaid flowchart）
+        if getattr(args, 'visualize', False):
+            import visualizer
+            deps_data = _to_deps_data(packages, edges)
+            depth = getattr(args, 'depth', 3) or 3
+            mermaid = visualizer.render_mermaid_tree(deps_data, depth=depth)
+            output_file = getattr(args, 'output', None)
+            if output_file:
+                out_path = Path(output_file)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(mermaid, encoding='utf-8')
+                logger.info(f"依赖树已写入: {output_file}")
+            else:
+                print(mermaid)
+
+        # 冲突影响范围分析
+        if getattr(args, 'impact', False):
+            import impact_analyzer
+            deps_data = _to_deps_data(packages, edges)
+            conflicts = analyzer.detect_conflicts()
+            conflicts_data = [
+                {
+                    "package": c.package,
+                    "required_by": c.required_by,
+                    "conflict_type": c.conflict_type,
+                    "severity": c.severity.value,
+                    "suggestion": c.suggestion,
+                }
+                for c in conflicts
+            ]
+            impacts = impact_analyzer.analyze_conflict_impact(deps_data, conflicts_data)
+            output_file = getattr(args, 'output', None)
+            if output_file:
+                out_path = Path(output_file)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(
+                    json.dumps(impacts, indent=2, ensure_ascii=False),
+                    encoding='utf-8',
+                )
+                logger.info(f"影响分析已写入: {output_file}")
+            else:
+                print(impact_analyzer.format_impact_report(impacts))
+
         # 执行分析
         if args.conflicts:
             conflicts = analyzer.detect_conflicts()
             display_conflicts(conflicts)
-        
+
         if args.recommend:
             recommendations = analyzer.recommend_optimal_versions()
             display_recommendations(recommendations)
-        
+
         if args.security:
             vulns = analyzer.assess_security()
             display_vulnerabilities(vulns)
-        
+
         if args.updates:
             update_paths = analyzer.plan_update_paths()
             display_update_paths(update_paths)
-        
+
         # 生成完整报告
         if args.report:
             report = analyzer.generate_report(packages[0].name)
-            
+
             output_file = args.output if args.output else "dependency_report.json"
             analyzer.export_report_json(report, output_file)
             logger.info(f"报告已保存到: {output_file}")
-        
+
         # 显示摘要
-        if not any([args.conflicts, args.recommend, args.security, args.updates, args.report]):
+        if not any([args.conflicts, args.recommend, args.security, args.updates, args.report,
+                    getattr(args, 'visualize', False), getattr(args, 'impact', False)]):
             # 默认显示所有分析
             conflicts = analyzer.detect_conflicts()
             recommendations = analyzer.recommend_optimal_versions()
@@ -1740,6 +1813,35 @@ def cmd_health(args):
         print(f"\n评分结果已写入: {args.output}")
 
 
+def cmd_readme(args):
+    """生成项目依赖 README 章节（markdown 表格，按 ecosystem 分组）"""
+    project_path = args.project
+
+    print(f"正在生成依赖 README: {project_path}")
+    print("=" * 70)
+
+    # 解析依赖
+    packages, edges, ecosystem = parse_dependencies(project_path)
+    print(f"找到 {len(packages)} 个包, {len(edges)} 个依赖关系 (ecosystem={ecosystem})")
+
+    deps_data = _to_deps_data(packages, edges)
+
+    # 用 EcosystemFetcher 查 registry 获取 description/license
+    import readme_generator
+    fetcher = readme_generator.EcosystemFetcher()
+    markdown = readme_generator.generate_dependency_readme(deps_data, fetcher=fetcher)
+
+    # 输出
+    output_file = getattr(args, 'output', None)
+    if output_file:
+        out_path = Path(output_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(markdown, encoding='utf-8')
+        print(f"依赖 README 已写入: {output_file}")
+    else:
+        print(markdown)
+
+
 def main():
     """主函数 - 命令行入口"""
     parser = argparse.ArgumentParser(
@@ -1787,6 +1889,12 @@ def main():
     analyze_parser2.add_argument("--security", action="store_true", help="只检查安全漏洞")
     analyze_parser2.add_argument("--updates", action="store_true", help="只显示更新路径")
     analyze_parser2.add_argument("--report", action="store_true", help="生成完整报告")
+    analyze_parser2.add_argument("--visualize", action="store_true",
+                                  help="渲染 Mermaid 依赖树（flowchart TD）")
+    analyze_parser2.add_argument("--depth", type=int, default=3,
+                                  help="依赖树渲染深度（默认 3，从根出发的依赖层数）")
+    analyze_parser2.add_argument("--impact", action="store_true",
+                                  help="分析冲突影响范围（反向追溯受影响包 + 依赖链）")
     analyze_parser2.add_argument("-o", "--output", help="报告输出文件路径")
     
     # query 命令
@@ -1818,6 +1926,12 @@ def main():
     health_parser.add_argument("project", help="项目路径或依赖文件路径")
     health_parser.add_argument("-o", "--output", default=None,
                               help="可选: 评分结果 JSON 输出路径")
+
+    # readme 命令
+    readme_parser = subparsers.add_parser("readme", help="生成项目依赖 README 章节（markdown）")
+    readme_parser.add_argument("project", help="项目路径或依赖文件路径")
+    readme_parser.add_argument("-o", "--output", default=None,
+                               help="可选: markdown 输出路径（默认输出到 stdout）")
     
     args = parser.parse_args()
     
@@ -1834,6 +1948,7 @@ def main():
         "security": cmd_security,
         "report": cmd_report,
         "health": cmd_health,
+        "readme": cmd_readme,
     }
     
     commands[args.command](args)
