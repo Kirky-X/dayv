@@ -1,20 +1,17 @@
 [
   {
     "id": 1,
-    "prompt": "用 dependency analyze 分析 /home/dev/projects/myapp 这个项目的依赖关系",
-    "expected": "调用 analyze 子命令：检测配置文件类型，解析依赖列表，构建 Ladybug 依赖图，输出依赖树、冲突检测结果和版本推荐。",
-    "scenario": "happy path — 显式指定子命令，测试最典型的项目依赖分析流程"
+    "prompt": "查询 numpy 包在 PyPI 上的最新版本和依赖关系",
+    "expected": "调用 pypi.py 拉取 numpy 详情，返回 latest_version + dependencies 字典；如网络不可用走异常处理路径"
   },
   {
     "id": 2,
-    "prompt": "帮我看看 numpy 这个包都依赖了哪些其他包",
-    "expected": "识别为包依赖查询需求，路由到 query 子命令，返回 numpy 包的上下游依赖关系（DependsOn 关系）。",
-    "scenario": "歧义场景 — 自然语言未指定子命令，测试路由识别能力"
+    "prompt": "分析一个混合 Python+Node.js 项目的依赖冲突",
+    "expected": "触发多生态系统 checkpoint，先询问扫描范围；解析 pyproject.toml 和 package.json，构建依赖图，检测冲突并输出 ConflictInfo"
   },
   {
     "id": 3,
-    "prompt": "用 dependency security 检查 requests 包有没有已知的安全漏洞",
-    "expected": "调用 security 子命令：扫描 requests 包漏洞库，输出 CVE ID、严重级别、受影响版本范围和修复版本建议。",
-    "scenario": "特殊模式 — 较少用的 security 子命令，测试漏洞扫描输出格式"
+    "prompt": "检查 requests 包的安全漏洞并生成 JSON 报告",
+    "expected": "调用 cmd_security：先查真实最新版本避免 false positive，再查漏洞，最后 export_report_json 输出报告文件"
   }
 ]
