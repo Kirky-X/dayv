@@ -1,7 +1,7 @@
 ---
 name: dependency
-description: "依赖分析引擎（7 生态系统：PyPI/npm/Maven/crates/RubyGems/Packagist/NuGet）。 When: 用户请求分析项目依赖、检测版本冲突、查询包依赖关系、检查安全漏洞或生成依赖报告时；触发词：dependency、依赖树、版本冲突、安全漏洞、dependency tree、version conflict、security vulnerability、package info、package.json、pyproject.toml、Cargo.toml、pom.xml、Gemfile、composer.json、.csproj"
-argument-hint: "<analyze|query|search|security|report> [options]"
+description: "依赖分析引擎（7 生态系统：PyPI/npm/Maven/crates/RubyGems/Packagist/NuGet）。 When: 用户请求分析项目依赖、检测版本冲突、查询包依赖关系、检查安全漏洞、生成依赖报告、HTML/PDF 报告、SBOM 物料清单或依赖健康度评分时；触发词：dependency、依赖树、版本冲突、安全漏洞、dependency tree、version conflict、security vulnerability、package info、package.json、pyproject.toml、Cargo.toml、pom.xml、Gemfile、composer.json、.csproj、SBOM、SPDX、健康度、health score"
+argument-hint: "<analyze|query|search|security|report|health> [options]"
 license: MIT
 ---
 
@@ -17,7 +17,8 @@ license: MIT
 ├─ 查询某个包的详情（版本/依赖/许可证）→ query <pkg> [-e <ecosystem>]
 ├─ 按关键词搜索包                    → search <keyword> [-e <ecosystem>]
 ├─ 检查某个包的安全漏洞              → security <pkg>
-└─ 从 deps_data.json 生成完整报告    → report <deps_data.json> [-o <file>]
+├─ 从 deps_data.json 生成完整报告    → report <deps_data.json> [--format json|html|pdf|sbom] [-o <file>]
+└─ 评估项目依赖健康度（5 维度评分）   → health <project_path> [-o <file>]
 ```
 
 支持 7 个生态系统：Python(pypi) / Node.js(npm) / Java(maven) / Rust(crates) / Ruby(rubygems) / PHP(packagist) / .NET(nuget)。Go 和 C/C++ 不支持（无中央 registry）。
@@ -34,7 +35,8 @@ license: MIT
 | `query`    | 查询包依赖             | 查询某个包的上下游依赖         |
 | `search`   | 搜索包                 | 搜索包信息                     |
 | `security` | 检查安全漏洞           | 扫描包的安全漏洞               |
-| `report`   | 生成完整报告           | 生成 JSON 格式的完整分析报告   |
+| `report`   | 生成完整报告           | 生成 JSON/HTML/PDF/SBOM 格式的分析报告 |
+| `health`   | 依赖健康度评分         | 评估项目依赖健康度（5 维度评分 + 雷达图 + 改进建议） |
 
 ---
 
@@ -77,9 +79,23 @@ python scripts/dependency_analyzer.py search "logging" -e npm
 # 检查安全漏洞（先查真实最新版本，避免 false positive）
 python scripts/dependency_analyzer.py security requests
 
-# 生成完整报告（JSON 格式，输入是 deps_data.json 而非项目路径）
-python scripts/dependency_analyzer.py report deps_data.json -o report.json
+# 生成完整报告（支持 4 种格式，输入是 deps_data.json 而非项目路径）
+python scripts/dependency_analyzer.py report deps_data.json --format json -o report.json
+python scripts/dependency_analyzer.py report deps_data.json --format html -o report.html
+python scripts/dependency_analyzer.py report deps_data.json --format pdf  -o report.pdf
+python scripts/dependency_analyzer.py report deps_data.json --format sbom -o project-sbom.spdx.json
   # deps_data.json schema: {"packages": [{name, version, ecosystem, is_root}], "edges": [{source, target, constraint}]}
+  # --format json (默认): 与 export_report_json schema 一致的 JSON 报告
+  # --format html: 含可排序表格的 HTML 报告（支持中文，防 XSS）
+  # --format pdf:  HTML 转 PDF（依赖 weasyprint，未安装时显式报错）
+  # --format sbom: SPDX 2.3 JSON 格式的软件物料清单
+
+# 评估项目依赖健康度（5 维度评分 + 雷达图 + 改进建议）
+python scripts/dependency_analyzer.py health /path/to/project
+python scripts/dependency_analyzer.py health /path/to/project -o health.json
+  # 输出: 总分(0-100) + 5 维度评分 + 改进建议 + Mermaid 雷达图
+  # 阈值: >=70 healthy, 50-69 warning, <50 danger
+  # 维度: 版本新旧(0.2) / 漏洞状态(0.3) / 维护状态(0.15) / 依赖稳定(0.2) / 许可证合规(0.15)
 ```
 
 ---
@@ -122,6 +138,40 @@ python scripts/dependency_analyzer.py report deps_data.json -o report.json
 - 避免已知漏洞
 - 尽量使用最新稳定版
 - 提供更新路径和迁移步骤
+
+### 5. HTML/PDF 报告输出
+
+`report --format html|pdf` 生成可视化报告：
+- **HTML**: 基于 Jinja2 模板，含 5 大章节（项目概览/依赖列表/冲突检测/漏洞检测/版本推荐），表格支持点击表头排序，UTF-8 编码支持中文，自动转义防 XSS
+- **PDF**: 由 HTML 经 weasyprint 转换，需安装 `pip install weasyprint`（系统依赖：`apt install libpango-1.0-0 libpangoft2-1.0-0`）；未安装时显式抛 `RuntimeError` 提示安装，不静默失败
+- **JSON** (默认): 与 `export_report_json` schema 完全一致，向后兼容
+- 复用 `report_renderer.render_report(report_dict, output_path, fmt)` 统一入口
+
+### 6. SBOM 生成 (SPDX 2.3)
+
+`report --format sbom` 生成软件物料清单：
+- **标准**: SPDX 2.3 JSON（国际标准，参考 https://spdx.github.io/spdx-spec/）
+- **顶层字段**: SPDXVersion / DataLicense(CC0-1.0) / SPDXID / DocumentName / DocumentNamespace(含 UUID 保证唯一) / CreationInfo / Packages / Relationships
+- **Package 字段**: Name / SPDXID / VersionInfo / DownloadLocation(按 ecosystem 拼 registry URL) / FilesAnalyzed(false) / LicenseConcluded / Supplier
+- **Relationships**: DESCRIBES(文档→根包) + DEPENDS_ON(来自 edges)
+- **输出文件**: 默认 `{project_name}-sbom.spdx.json`
+- 复用 `sbom_generator.write_sbom(packages, edges, project_name, output_path)`
+
+### 7. 依赖健康度评分
+
+`health <project_path>` 综合评估依赖健康度：
+- **总分**: 0-100，加权平均 5 个维度
+- **维度与权重**:
+  | 维度 | 权重 | 评分逻辑 |
+  |------|------|----------|
+  | version_freshness 版本新旧度 | 0.20 | `100 * (1 - update_paths/total_packages)` |
+  | vulnerability_status 漏洞状态 | 0.30 | `100 - Σ(漏洞扣分)`，critical=40/high=25/medium=20/low=5 |
+  | maintenance_status 维护状态 | 0.15 | base=50，有更新活动+25，无漏洞+25 |
+  | dependency_stability 依赖稳定性 | 0.20 | `100 - conflicts*25` |
+  | license_compliance 许可证合规性 | 0.15 | 默认 75（无 license 数据时中性分） |
+- **阈值**: `>=70` healthy / `50-69` warning / `<50` danger
+- **输出**: 总分 + 5 维度 ASCII 进度条 + 改进建议（针对最低分维度）+ Mermaid 雷达图
+- 复用 `health_scorer.score_health(report_dict)` + `health_scorer.render_radar_mermaid(result)`
 
 ---
 
@@ -203,6 +253,56 @@ python scripts/dependency_analyzer.py report deps_data.json -o report.json
 }
 ```
 
+### health 子命令输出（`health_scorer.score_health` 输出）
+
+```
+  总分: 69.0/100  等级: WARNING
+
+  5 维度评分:
+    版本新旧度        ██████████░░░░░░░░░░  50.0
+    漏洞状态         ███████████░░░░░░░░░  55.0
+    维护状态         ███████████████░░░░░  75.0
+    依赖稳定性        ████████████████████ 100.0
+    许可证合规性       ███████████████░░░░░  75.0
+
+  改进建议:
+    1. 版本新旧度最低（50.0），建议升级过时依赖到最新稳定版
+
+```mermaid
+xychart-beta
+    title "依赖健康度评分 - 总分 69.0 (warning)"
+    x-axis ["version_freshness(版本新旧)", ...]
+    y-axis "Score" 0 --> 100
+    bar [50.0, 55.0, 75.0, 100.0, 75.0]
+```
+```
+
+### SBOM 输出（`sbom_generator.generate_sbom` 输出，SPDX 2.3）
+
+```json
+{
+  "SPDXVersion": "SPDX-2.3",
+  "DataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "DocumentName": "my-project",
+  "DocumentNamespace": "https://dayv.local/my-project/<uuid>",
+  "CreationInfo": {
+    "Created": "2024-01-01T00:00:00Z",
+    "Creators": ["Tool: dayv-dependency-analyzer-1.0"],
+    "LicenseListVersion": "3.21"
+  },
+  "Packages": [
+    {"Name": "requests", "SPDXID": "SPDXRef-Package-requests", "VersionInfo": "2.25.0",
+     "DownloadLocation": "https://pypi.org/project/requests", "FilesAnalyzed": false,
+     "LicenseConcluded": "NOASSERTION", "Supplier": "NOASSERTION"}
+  ],
+  "Relationships": [
+    {"SPDXElementID": "SPDXRef-DOCUMENT", "RelationshipType": "DESCRIBES", "RelatedSPDXElement": "SPDXRef-Package-my-project"},
+    {"SPDXElementID": "SPDXRef-Package-my-project", "RelationshipType": "DEPENDS_ON", "RelatedSPDXElement": "SPDXRef-Package-requests"}
+  ]
+}
+```
+
 ---
 
 ## Scripts
@@ -211,6 +311,9 @@ python scripts/dependency_analyzer.py report deps_data.json -o report.json
 | --------------------- | ----------------------------- | -------- | -------- |
 | dependency_analyzer.py| 主分析引擎                    | `main()` | `python dependency_analyzer.py <subcommand> [args]` |
 | utils.py              | 版本比较和约束检查工具        | （库模块，不直接运行）| `from utils import check_version_constraint, compare_versions, sort_versions` |
+| report_renderer.py    | HTML/PDF/JSON 报告渲染器      | `render_report(report, output, fmt)` | 被 `report --format` 调用 |
+| health_scorer.py      | 依赖健康度评分（5 维度）      | `score_health(report_dict)` / `render_radar_mermaid(result)` | 被 `health` 子命令调用 |
+| sbom_generator.py     | SPDX 2.3 SBOM 生成器          | `write_sbom(packages, edges, project_name, output)` | 被 `report --format sbom` 调用 |
 | pypi.py               | PyPI 包信息获取               | `get_package(name)` / `search_packages(keyword)` | `python pypi.py <package>` 或 `python pypi.py --search <keyword>` |
 | npm.py                | npm 包信息获取                | `get_package(name)` / `search_packages(keyword)` | `python npm.py <package>` 或 `python npm.py --search <keyword>` |
 | maven.py              | Maven 包信息获取              | `get_package(group:artifact)` | `python maven.py <groupId>:<artifactId>` |
@@ -241,7 +344,7 @@ python scripts/dependency_analyzer.py report deps_data.json -o report.json
 | `db_path` | str | `/tmp/ladybug_deps.db` | Ladybug GraphDB 文件路径，None 时自动创建临时目录 |
 | `vulnerability_db` | str | `https://api.osv.dev/v1` | OSV 漏洞数据库 API 端点 |
 | `ecosystems` | list | 7 个全量 | 启用的生态系统列表，未列出的 ecosystem 在 `query`/`search` 中会 `sys.exit(1)` |
-| `output_format` | str | `json` | 报告输出格式（当前仅支持 `json`） |
+| `output_format` | str | `json` | 报告输出格式（`json` / `html` / `pdf` / `sbom`，通过 `report --format` 指定） |
 | `max_cycles_detect` | int | 100 | 循环依赖检测上限，超出后截断并提示调大 |
 | `max_recommendations` | int | 20 | 版本推荐显示上限（`MAX_RECOMMENDATIONS_DISPLAY`） |
 
@@ -272,11 +375,32 @@ python scripts/dependency_analyzer.py report deps_data.json -o report.json
 
 测试 prompt 集见 `test-prompts.json`（3 个典型场景覆盖 query/security/多语言 analyze）。
 
+单元测试（不入 git）：
+- `scripts/tests/test_report_renderer.py` — HTML/PDF/JSON 渲染契约（11 个测试）
+- `scripts/tests/test_health_scorer.py` — 5 维度评分逻辑（14 个测试）
+- `scripts/tests/test_sbom_generator.py` — SPDX 2.3 schema 完整性（18 个测试）
+
 验证步骤：
-1. `python -m py_compile scripts/*.py` — 9 个脚本语法检查
+1. `python -m py_compile scripts/*.py` — 12 个脚本语法检查（含 3 个新模块）
 2. `python scripts/dependency_analyzer.py query numpy` — 验证 PyPI 查询链路
 3. `python scripts/dependency_analyzer.py security requests` — 验证漏洞扫描链路
-4. 检查输出是否符合 `Output Example` 章节的 schema
+4. `python scripts/dependency_analyzer.py report deps_data.json --format html -o r.html` — 验证 HTML 报告
+5. `python scripts/dependency_analyzer.py report deps_data.json --format sbom -o r.spdx.json` — 验证 SBOM
+6. `python scripts/dependency_analyzer.py health /path/to/project` — 验证健康度评分
+7. `python -m pytest scripts/tests/ tests/ -v` — 跑全部单元测试（79 个）
+8. 检查输出是否符合 `Output Example` 章节的 schema
+
+## Dependencies
+
+| 依赖 | 版本 | 用途 | 必需 |
+|------|------|------|------|
+| real_ladybug | latest | 图数据库（依赖关系存储） | ✅ 必需 |
+| httpx | latest | HTTP 客户端（registry 查询） | ✅ 必需 |
+| ua-generator | latest | 随机 User-Agent（防封禁） | ✅ 必需 |
+| semver | latest | 语义化版本比较 | ✅ 必需 |
+| Jinja2 | >=3.0 | HTML 模板渲染 | ✅ 必需（HTML/PDF 报告） |
+| weasyprint | >=60 | HTML → PDF 转换 | ⚠️ 可选（仅 PDF 格式需要，未安装时显式报错） |
+| tomli / tomllib | latest | TOML 解析（pyproject.toml） | ✅ 必需（Python < 3.11 用 tomli） |
 
 ## 异常处理
 
@@ -291,6 +415,7 @@ python scripts/dependency_analyzer.py report deps_data.json -o report.json
 | 配置文件解析错误（语法） | TOML/JSON/YAML 解析报错 | 报错位置 + 行号 | 询问用户是否修复，不静默跳过 |
 | 多生态系统配置文件并存 | 同目录检测到 ≥2 类配置文件 | 🔴 CHECKPOINT：列出检测到的生态系统，询问扫描范围 | 用户未选择则按全部处理 |
 | Maven `pom.xml`/`Cargo.toml` 等命中但无 parser | detect 识别但 parsers 表无对应实现 | 显式提示"自动解析器暂未实现" | 引导改用 `query -e <ecosystem>` 子命令 |
+| weasyprint 未安装但请求 PDF 格式 | `report --format pdf` 时 `import weasyprint` 失败 | 显式抛 `RuntimeError` 含安装命令 `pip install weasyprint` | 不降级为 HTML，让用户显式选择 `--format html` |
 
 ---
 

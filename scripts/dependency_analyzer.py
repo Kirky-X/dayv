@@ -797,10 +797,9 @@ class DependencyAnalyzer:
         
         return report
     
-    def export_report_json(self, report: AnalysisReport, 
-                          output_file: str):
-        """导出报告为 JSON"""
-        report_dict = {
+    def report_to_dict(self, report: AnalysisReport) -> Dict[str, Any]:
+        """将 AnalysisReport 转换为 dict（供 JSON/HTML/PDF 渲染用）"""
+        return {
             "timestamp": report.timestamp,
             "root_package": report.root_package,
             "summary": {
@@ -843,11 +842,16 @@ class DependencyAnalyzer:
             ],
             "recommendations": report.recommendations,
         }
-        
+
+    def export_report_json(self, report: AnalysisReport,
+                          output_file: str):
+        """导出报告为 JSON"""
+        report_dict = self.report_to_dict(report)
+
         output_path = Path(output_file)
         with output_path.open('w', encoding='utf-8') as f:
             json.dump(report_dict, f, indent=2, ensure_ascii=False)
-        
+
         logger.info(f"报告已导出: {output_file}")
     
     def close(self):
@@ -1583,25 +1587,157 @@ def cmd_security(args):
 
 
 def cmd_report(args):
-    """生成完整报告"""
+    """生成完整报告（支持 json/html/pdf/sbom 格式）"""
     data_file = args.data_file
-    output_file = args.output or "dependency_report.json"
-    
-    print(f"正在生成依赖报告: {data_file}")
+    fmt = getattr(args, 'format', 'json') or 'json'
+    output_file = args.output  # 默认 None，按格式决定
+
+    print(f"正在生成依赖报告: {data_file} (format={fmt})")
     print("=" * 70)
-    
-    # 设置参数并调用 analyze-data
-    class Args:
-        def __init__(self):
-            self.data_file = data_file
-            self.conflicts = True
-            self.recommend = True
-            self.security = True
-            self.updates = True
-            self.report = True
-            self.output = output_file
-    
-    cmd_analyze_data(Args())
+
+    data_path = Path(data_file)
+    if not data_path.exists():
+        logger.error(f"找不到文件 {data_file}")
+        sys.exit(1)
+
+    try:
+        with data_path.open('r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"解析 JSON 文件失败: {e}")
+        sys.exit(1)
+
+    if "packages" not in data or "edges" not in data:
+        logger.error("JSON 文件必须包含 'packages' 和 'edges' 字段")
+        sys.exit(1)
+
+    # SBOM 格式：直接用 packages + edges 生成 SPDX（无需分析报告）
+    if fmt == "sbom":
+        import sbom_generator
+        project_name = data["packages"][0]["name"] if data["packages"] else "unknown"
+        if output_file is None:
+            output_file = f"{project_name}-sbom.spdx.json"
+        try:
+            result_path = sbom_generator.write_sbom(
+                packages=data["packages"],
+                edges=data["edges"],
+                project_name=project_name,
+                output_path=output_file,
+            )
+            print(f"SBOM 已生成: {result_path}")
+        except Exception as e:
+            logger.error(f"SBOM 生成失败: {e}")
+            sys.exit(1)
+        return
+
+    # JSON/HTML/PDF：先生成分析报告
+    packages = []
+    for pkg_data in data["packages"]:
+        packages.append(DependencyNode(
+            name=pkg_data["name"],
+            version=pkg_data.get("version", "0.0.0"),
+            ecosystem=pkg_data.get("ecosystem", "pypi"),
+            is_root=pkg_data.get("is_root", False)
+        ))
+
+    edges = []
+    for edge_data in data["edges"]:
+        edges.append(DependencyEdge(
+            source=edge_data["source"],
+            target=edge_data["target"],
+            constraint=edge_data.get("constraint", "*")
+        ))
+
+    analyzer = DependencyAnalyzer()
+    try:
+        analyzer.build_dependency_graph(packages, edges)
+        report = analyzer.generate_report(
+            packages[0].name if packages else "unknown"
+        )
+        report_dict = analyzer.report_to_dict(report)
+    finally:
+        analyzer.close()
+
+    # 默认输出文件名
+    if output_file is None:
+        output_file = "dependency_report.json"
+
+    # 按格式分派到 report_renderer
+    import report_renderer
+    try:
+        result_path = report_renderer.render_report(report_dict, output_file, fmt=fmt)
+        print(f"报告已生成: {result_path} (format={fmt})")
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    except RuntimeError as e:
+        # weasyprint 不可用等运行时错误
+        logger.error(str(e))
+        sys.exit(1)
+
+
+def cmd_health(args):
+    """依赖健康度评分（5 维度 + 雷达图 + 改进建议）"""
+    project_path = args.project
+
+    print(f"正在评估依赖健康度: {project_path}")
+    print("=" * 70)
+
+    # 解析依赖（与 cmd_analyze 一致）
+    packages, edges, ecosystem = parse_dependencies(project_path)
+    print(f"找到 {len(packages)} 个包, {len(edges)} 个依赖关系 (ecosystem={ecosystem})")
+
+    analyzer = DependencyAnalyzer()
+    try:
+        analyzer.build_dependency_graph(packages, edges)
+        report = analyzer.generate_report(
+            packages[0].name if packages else "unknown"
+        )
+        report_dict = analyzer.report_to_dict(report)
+    finally:
+        analyzer.close()
+
+    # 计算健康度评分
+    import health_scorer
+    result = health_scorer.score_health(report_dict)
+
+    # 输出结果
+    print()
+    print(f"  总分: {result['total_score']}/100  等级: {result['level'].upper()}")
+    print()
+    print("  5 维度评分:")
+    dim_names = {
+        "version_freshness": "版本新旧度",
+        "vulnerability_status": "漏洞状态",
+        "maintenance_status": "维护状态",
+        "dependency_stability": "依赖稳定性",
+        "license_compliance": "许可证合规性",
+    }
+    for name, score in result["dimensions"].items():
+        cn = dim_names.get(name, name)
+        bar = "█" * int(score / 5) + "░" * (20 - int(score / 5))
+        print(f"    {cn:<12} {bar} {score:>5.1f}")
+
+    print()
+    if result["suggestions"]:
+        print("  改进建议:")
+        for i, s in enumerate(result["suggestions"], 1):
+            print(f"    {i}. {s}")
+    else:
+        print("  ✅ 所有维度均健康，无需特别改进")
+
+    # 雷达图（Mermaid）
+    print()
+    radar = health_scorer.render_radar_mermaid(result)
+    print(radar)
+
+    # 可选：写出 JSON 结果
+    if getattr(args, 'output', None):
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open('w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print(f"\n评分结果已写入: {args.output}")
 
 
 def main():
@@ -1670,10 +1806,18 @@ def main():
     security_parser.add_argument("package", help="包名")
     
     # report 命令
-    report_parser = subparsers.add_parser("report", help="生成完整报告")
+    report_parser = subparsers.add_parser("report", help="生成完整报告（支持 json/html/pdf/sbom 格式）")
     report_parser.add_argument("data_file", help="JSON 格式的依赖数据文件")
-    report_parser.add_argument("-o", "--output", default="dependency_report.json",
-                              help="报告输出文件路径 (默认: dependency_report.json)")
+    report_parser.add_argument("-o", "--output", default=None,
+                              help="报告输出文件路径 (默认按格式决定: dependency_report.json / {project}-sbom.spdx.json)")
+    report_parser.add_argument("--format", choices=["json", "html", "pdf", "sbom"],
+                              default="json", help="报告格式 (默认: json)")
+
+    # health 命令
+    health_parser = subparsers.add_parser("health", help="依赖健康度评分（5 维度 + 雷达图）")
+    health_parser.add_argument("project", help="项目路径或依赖文件路径")
+    health_parser.add_argument("-o", "--output", default=None,
+                              help="可选: 评分结果 JSON 输出路径")
     
     args = parser.parse_args()
     
@@ -1688,7 +1832,8 @@ def main():
         "query": cmd_query,
         "search": cmd_search,
         "security": cmd_security,
-        "report": cmd_report
+        "report": cmd_report,
+        "health": cmd_health,
     }
     
     commands[args.command](args)
