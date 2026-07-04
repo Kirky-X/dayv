@@ -1,7 +1,7 @@
 ---
 name: dependency
 description: "依赖分析引擎（7 生态系统：PyPI/npm/Maven/crates/RubyGems/Packagist/NuGet）。 When: 用户请求分析项目依赖、检测版本冲突、查询包依赖关系、检查安全漏洞、生成依赖报告、HTML/PDF 报告、SBOM 物料清单或依赖健康度评分时；触发词：dependency、依赖树、版本冲突、安全漏洞、dependency tree、version conflict、security vulnerability、package info、package.json、pyproject.toml、Cargo.toml、pom.xml、Gemfile、composer.json、.csproj、SBOM、SPDX、健康度、health score"
-argument-hint: "<analyze|query|search|security|report|health> [options]"
+argument-hint: "<analyze|query|search|security|report|health|readme|simulate|monitor> [options]"
 license: MIT
 ---
 
@@ -18,10 +18,12 @@ license: MIT
 │     · --impact: 分析冲突影响范围（受影响包 + 依赖链）
 ├─ 查询某个包的详情（版本/依赖/许可证）→ query <pkg> [-e <ecosystem>]
 ├─ 按关键词搜索包                    → search <keyword> [-e <ecosystem>]
-├─ 检查某个包的安全漏洞              → security <pkg>
+├─ 检查某个包的安全漏洞              → security <pkg> [--priority]
 ├─ 从 deps_data.json 生成完整报告    → report <deps_data.json> [--format json|html|pdf|sbom] [-o <file>]
 ├─ 评估项目依赖健康度（5 维度评分）   → health <project_path> [-o <file>]
-└─ 生成项目依赖 README 章节（markdown）→ readme <project_path> [-o <file>]
+├─ 生成项目依赖 README 章节（markdown）→ readme <project_path> [-o <file>]
+├─ 模拟升级依赖到目标版本的影响      → simulate <pkg> <target_ver> [--project <path>]
+└─ 漏洞持续监控（定时扫描 + 告警）    → monitor <project_path> [--cron <expr>] [--webhook <url>]
 ```
 
 支持 7 个生态系统：Python(pypi) / Node.js(npm) / Java(maven) / Rust(crates) / Ruby(rubygems) / PHP(packagist) / .NET(nuget)。Go 和 C/C++ 不支持（无中央 registry）。
@@ -37,10 +39,12 @@ license: MIT
 | `analyze`  | 分析项目依赖           | 分析项目的依赖树和依赖关系（含 `--visualize` Mermaid 可视化、`--impact` 冲突影响范围） |
 | `query`    | 查询包依赖             | 查询某个包的上下游依赖         |
 | `search`   | 搜索包                 | 搜索包信息                     |
-| `security` | 检查安全漏洞           | 扫描包的安全漏洞               |
+| `security` | 检查安全漏洞           | 扫描包的安全漏洞（含 `--priority` 按修复优先级排序） |
 | `report`   | 生成完整报告           | 生成 JSON/HTML/PDF/SBOM 格式的分析报告 |
 | `health`   | 依赖健康度评分         | 评估项目依赖健康度（5 维度评分 + 雷达图 + 改进建议） |
 | `readme`   | 生成依赖 README 章节   | 从依赖列表生成 markdown 依赖说明章节（按 ecosystem 分组 + 表格） |
+| `simulate` | 升级影响模拟（dry-run）| 模拟升级某依赖到目标版本后的依赖树变化（风险等级 + 新增/移除依赖 + 冲突 + 回滚建议） |
+| `monitor`  | 漏洞持续监控           | 定时扫描项目漏洞状态，检测新漏洞时告警（控制台/webhook），记录扫描历史 |
 
 ---
 
@@ -82,6 +86,9 @@ python scripts/dependency_analyzer.py search "logging" -e npm
 
 # 检查安全漏洞（先查真实最新版本，避免 false positive）
 python scripts/dependency_analyzer.py security requests
+python scripts/dependency_analyzer.py security requests --priority
+  # --priority: 按 CVSS × 0.5 + exploit × 0.3 + business × 0.2 加权排序
+  # 输出: 优先级排名 + CVE ID + 包名 + 严重度 + 优先级分 + 修复建议
 
 # 生成完整报告（支持 4 种格式，输入是 deps_data.json 而非项目路径）
 python scripts/dependency_analyzer.py report deps_data.json --format json -o report.json
@@ -123,6 +130,25 @@ python scripts/dependency_analyzer.py readme /path/to/project -o DEPS.md
   # 每组一个 markdown 表格: 包名 | 版本 | 用途 | 许可证
   # 用途/许可证通过 subprocess 调 ecosystem 脚本（pypi.py/npm.py/...）查询
   # 查询失败时显示占位符 "-"，不崩溃
+
+# 升级影响模拟（dry-run，不实际升级）
+python scripts/dependency_analyzer.py simulate requests 2.31.0
+python scripts/dependency_analyzer.py simulate requests 2.31.0 --project /path/to/project
+python scripts/dependency_analyzer.py simulate react 18.0.0 --project /path/to/project -o sim.json
+  # 输出: 风险等级 + 新增/移除依赖 + 冲突 + 回滚建议
+  # 风险等级: major 升级=high / minor=medium / patch=low / 降级=high
+  # --project: 分析现有依赖图（无则仅基于版本号判定风险）
+  # 回滚建议按 ecosystem 生成（pypi: git checkout requirements.txt / npm: git checkout package.json）
+
+# 漏洞持续监控（定时扫描 + 告警 + 历史对比）
+python scripts/dependency_analyzer.py monitor /path/to/project
+python scripts/dependency_analyzer.py monitor /path/to/project --cron "0 9 * * *"
+python scripts/dependency_analyzer.py monitor /path/to/project --webhook https://hooks.example.com/dayv
+  # 输出: 扫描结果 + 与历史对比的新增漏洞 + 告警文本
+  # --cron: 生成 crontab 条目字符串（不实际安装，需手动 crontab -e）
+  # --webhook: 检测到新漏洞时 POST JSON 告警到 webhook
+  # 历史文件: ~/.dayv/monitor_history.json（保留最近 50 次扫描）
+  # 告警格式: [DAYV ALERT] 检测到 N 个新漏洞 + CVE 列表
 ```
 
 ---
@@ -254,6 +280,72 @@ python scripts/dependency_analyzer.py readme /path/to/project -o DEPS.md
 - **缓存**: `EcosystemFetcher` 内置 dict 缓存，避免重复查询同一包
 - **输出**: stdout（默认）或 `-o DEPS.md` 写文件
 - 复用 `readme_generator.generate_dependency_readme(deps_data, fetcher=...)`
+
+### 11. 升级影响模拟 (dry-run)
+
+`simulate <package> <target_version> [--project <path>]` 模拟升级某依赖到目标版本后的影响，不实际升级：
+- **风险等级判定**:
+  | 变化类型 | 风险等级 |
+  |---------|---------|
+  | major 升级 (X.y.z → X+1.0.0) | high |
+  | minor 升级 (x.Y.z → x.Y+1.0) | medium |
+  | patch 升级 (x.y.Z → x.y.Z+1) | low |
+  | 降级 | high |
+  | 版本解析失败 | high（保守处理） |
+- **新增/移除依赖**: 对比 target_version 的依赖列表（通过 ecosystem 脚本查询）与 deps_data 中的现有依赖
+- **冲突检测**: 新增依赖的版本约束与现有依赖图中的版本不兼容时报告冲突
+- **回滚建议**: 按 ecosystem 生成（pypi: `git checkout requirements.txt` / npm: `git checkout package.json && npm install` / ...）
+- **输出 schema**:
+  ```json
+  {
+    "package": "requests", "current_version": "2.28.0", "target_version": "3.0.0",
+    "risk_level": "high",
+    "added_dependencies": [{"name": "urllib3", "constraint": ">=2.0.0"}],
+    "removed_dependencies": [],
+    "conflicts": [{"package": "urllib3", "reason": "目标版本需要 >=2.0.0，现有版本 1.26.0 不满足",
+                   "existing_version": "1.26.0", "required_constraint": ">=2.0.0"}],
+    "rollback_suggestion": "git checkout requirements.txt  # 或 pip install requests==2.28.0"
+  }
+  ```
+- **--project 可选**: 无项目路径时仅基于版本号判定风险；有项目路径时分析现有依赖图
+- 复用 `simulator.simulate_upgrade(deps_data, package, target_version, ecosystem, fetcher=None)` + `simulator.format_simulation_report(result)`
+
+### 12. 漏洞修复优先级排序
+
+`security <package> --priority` 对检测到的漏洞按修复优先级排序：
+- **三维度加权打分**:
+  | 维度 | 权重 | 评分逻辑 |
+  |------|------|----------|
+  | CVSS 严重度 | 0.5 | Critical=4 / High=3 / Medium=2 / Low=1 |
+  | 利用难度 | 0.3 | 有公开 exploit/PoC=2 / 无=1 |
+  | 业务影响 | 0.2 | 根依赖=3 / 直接依赖=2 / 传递依赖=1 |
+- **优先级总分** = CVSS × 0.5 + exploit × 0.3 + business × 0.2
+- **排序**: 按 priority_score 降序，priority_rank 从 1 开始
+- **exploit 检测**: `vuln["has_exploit"]=True` 或 `vuln["references"]` 含 "exploit"/"poc" 关键词
+- **业务影响判定**: 从 deps_data 中查找包层级（is_root / 被根直接依赖 / 传递依赖）
+- **修复建议**: 有 fixed_version 时建议升级；无 fixed_version 时明确提示"暂无已知修复版本"（不静默）
+- **输出**: 序号 + CVE ID + 包名@版本 + 严重度 + 优先级分 + 修复建议
+- 复用 `vulnerability_prioritizer.prioritize_vulnerabilities(vulns, deps_data)` + `vulnerability_prioritizer.format_priority_report(prioritized)`
+
+### 13. 漏洞持续监控
+
+`monitor <project_path> [--cron <expr>] [--webhook <url>]` 定时扫描项目漏洞状态：
+- **扫描**: 调用 `DependencyAnalyzer.assess_security()` 获取当前漏洞列表
+- **历史对比**: 与 `~/.dayv/monitor_history.json` 中最近一次扫描对比，找出新增漏洞（按 cve_id + package 唯一）
+- **告警**: 检测到新漏洞时输出告警文本 + 可选 webhook POST
+  ```
+  [DAYV ALERT] 检测到 3 个新漏洞
+  - CVE-2024-1234 (Critical) on requests@2.28.0
+  - CVE-2024-5678 (High) on urllib3@1.26.12
+  ```
+- **webhook**: `--webhook <url>` POST JSON payload（含 alert_type/count/vulnerabilities/message），成功返回 True / 失败返回 False（不抛异常）
+- **cron 模式**: `--cron "0 9 * * *"` 输出 crontab 条目字符串（**不实际安装**，需手动 `crontab -e`）
+  ```
+  0 9 * * * cd /path/to/project && /usr/bin/env python3 .../dependency_analyzer.py monitor /path/to/project >> /tmp/dayv-monitor-<name>.log 2>&1
+  ```
+- **历史文件**: `~/.dayv/monitor_history.json`，保留最近 50 次扫描（`MAX_HISTORY_ENTRIES=50`），自动创建父目录
+- **scanner 可注入**: `run_scan(project_path, scanner=None)` 支持注入 mock scanner 用于测试
+- 复用 `monitor.run_scan()` / `monitor.compare_with_history()` / `monitor.send_alert()` / `monitor.generate_cron_entry()` / `monitor.format_alert()` / `monitor.save_scan_to_history()`
 
 ---
 
@@ -399,6 +491,9 @@ xychart-beta
 | visualizer.py         | Mermaid 依赖树可视化          | `render_mermaid_tree(deps_data, depth=3)` | 被 `analyze --visualize` 调用 |
 | impact_analyzer.py    | 冲突影响范围分析              | `analyze_conflict_impact(deps_data, conflicts)` / `format_impact_report(impacts)` | 被 `analyze --impact` 调用 |
 | readme_generator.py   | 项目依赖 README 生成器        | `generate_dependency_readme(deps_data, fetcher=None)` + `EcosystemFetcher` | 被 `readme` 子命令调用 |
+| simulator.py          | 升级影响模拟（dry-run）       | `simulate_upgrade(deps_data, package, target_version, ecosystem, fetcher=None)` / `format_simulation_report(result)` | 被 `simulate` 子命令调用 |
+| vulnerability_prioritizer.py | 漏洞修复优先级排序     | `prioritize_vulnerabilities(vulns, deps_data)` / `format_priority_report(prioritized)` | 被 `security --priority` 调用 |
+| monitor.py            | 漏洞持续监控                  | `run_scan()` / `compare_with_history()` / `send_alert()` / `generate_cron_entry()` / `format_alert()` / `save_scan_to_history()` | 被 `monitor` 子命令调用 |
 | pypi.py               | PyPI 包信息获取               | `get_package(name)` / `search_packages(keyword)` | `python pypi.py <package>` 或 `python pypi.py --search <keyword>` |
 | npm.py                | npm 包信息获取                | `get_package(name)` / `search_packages(keyword)` | `python npm.py <package>` 或 `python npm.py --search <keyword>` |
 | maven.py              | Maven 包信息获取              | `get_package(group:artifact)` | `python maven.py <groupId>:<artifactId>` |
@@ -462,24 +557,30 @@ xychart-beta
 
 单元测试（不入 git）：
 - `scripts/tests/test_report_renderer.py` — HTML/PDF/JSON 渲染契约（11 个测试）
-- `scripts/tests/test_health_scorer.py` — 5 维度评分逻辑（14 个测试）
-- `scripts/tests/test_sbom_generator.py` — SPDX 2.3 schema 完整性（18 个测试）
+- `scripts/tests/test_health_scorer.py` — 5 维度评分逻辑（15 个测试）
+- `scripts/tests/test_sbom_generator.py` — SPDX 2.3 schema 完整性（22 个测试）
 - `scripts/tests/test_visualizer.py` — Mermaid 依赖树渲染 + 深度控制 + 循环检测（13 个测试）
 - `scripts/tests/test_readme_generator.py` — README 生成 + ecosystem 分组 + fetcher 注入（13 个测试）
 - `scripts/tests/test_impact_analyzer.py` — 冲突影响范围 + BFS 反向追溯 + 依赖链（10 个测试）
+- `scripts/tests/test_simulator.py` — 升级影响模拟 + 风险等级 + 冲突检测 + fetcher 注入（18 个测试）
+- `scripts/tests/test_vulnerability_prioritizer.py` — CVSS + exploit + business 加权排序（24 个测试）
+- `scripts/tests/test_monitor.py` — cron 生成 + 历史对比 + 告警格式化 + webhook（27 个测试）
 
 验证步骤：
-1. `python -m py_compile scripts/*.py` — 15 个脚本语法检查（含 3 个新模块）
+1. `python -m py_compile scripts/*.py` — 18 个脚本语法检查（含 3 个新模块）
 2. `python scripts/dependency_analyzer.py query numpy` — 验证 PyPI 查询链路
 3. `python scripts/dependency_analyzer.py security requests` — 验证漏洞扫描链路
-4. `python scripts/dependency_analyzer.py report deps_data.json --format html -o r.html` — 验证 HTML 报告
-5. `python scripts/dependency_analyzer.py report deps_data.json --format sbom -o r.spdx.json` — 验证 SBOM
-6. `python scripts/dependency_analyzer.py health /path/to/project` — 验证健康度评分
-7. `python scripts/dependency_analyzer.py analyze /path/to/project --visualize` — 验证 Mermaid 依赖树
-8. `python scripts/dependency_analyzer.py analyze /path/to/project --impact` — 验证冲突影响分析
-9. `python scripts/dependency_analyzer.py readme /path/to/project` — 验证依赖 README 生成
-10. `python -m pytest scripts/tests/ tests/ -v` — 跑全部单元测试（115 个 = 79 原 + 36 新）
-11. 检查输出是否符合 `Output Example` 章节的 schema
+4. `python scripts/dependency_analyzer.py security requests --priority` — 验证漏洞优先级排序
+5. `python scripts/dependency_analyzer.py report deps_data.json --format html -o r.html` — 验证 HTML 报告
+6. `python scripts/dependency_analyzer.py report deps_data.json --format sbom -o r.spdx.json` — 验证 SBOM
+7. `python scripts/dependency_analyzer.py health /path/to/project` — 验证健康度评分
+8. `python scripts/dependency_analyzer.py analyze /path/to/project --visualize` — 验证 Mermaid 依赖树
+9. `python scripts/dependency_analyzer.py analyze /path/to/project --impact` — 验证冲突影响分析
+10. `python scripts/dependency_analyzer.py readme /path/to/project` — 验证依赖 README 生成
+11. `python scripts/dependency_analyzer.py simulate requests 2.31.0` — 验证升级影响模拟
+12. `python scripts/dependency_analyzer.py monitor /path/to/project --cron "0 9 * * *"` — 验证 cron 条目生成
+13. `python -m pytest scripts/tests/ tests/ -v` — 跑全部单元测试（153 个 = 84 原 + 18 + 24 + 27 新）
+14. 检查输出是否符合 `Output Example` 章节的 schema
 
 ## Dependencies
 

@@ -1641,17 +1641,45 @@ def cmd_security(args):
 
         # 检查漏洞
         vulns = analyzer.assess_security()
-        
+
         if vulns:
-            print(f"\n发现 {len(vulns)} 个安全漏洞:")
-            for vuln in vulns:
-                print(f"\n  CVE: {vuln.cve_id}")
-                print(f"  包: {vuln.package}")
-                print(f"  影响版本: {vuln.version}")
-                print(f"  严重级别: {vuln.severity.value}")
-                print(f"  描述: {vuln.description}")
-                if vuln.fixed_version:
-                    print(f"  修复版本: {vuln.fixed_version}")
+            # --priority: 按 CVSS + exploit + business 加权排序
+            if getattr(args, 'priority', False):
+                import vulnerability_prioritizer
+                vuln_dicts = [
+                    {
+                        "cve_id": v.cve_id,
+                        "package": v.package,
+                        "version": v.version,
+                        "severity": v.severity.value,
+                        "description": v.description,
+                        "fixed_version": v.fixed_version,
+                    }
+                    for v in vulns
+                ]
+                # 单包 security 查询：被检查的包本身视为根依赖
+                deps_data = {
+                    "packages": [
+                        {"name": package_name, "version": latest_version,
+                         "is_root": True, "ecosystem": "pypi"}
+                    ],
+                    "edges": [],
+                }
+                prioritized = vulnerability_prioritizer.prioritize_vulnerabilities(
+                    vuln_dicts, deps_data
+                )
+                print(f"\n发现 {len(vulns)} 个安全漏洞（按修复优先级排序）:")
+                print(vulnerability_prioritizer.format_priority_report(prioritized))
+            else:
+                print(f"\n发现 {len(vulns)} 个安全漏洞:")
+                for vuln in vulns:
+                    print(f"\n  CVE: {vuln.cve_id}")
+                    print(f"  包: {vuln.package}")
+                    print(f"  影响版本: {vuln.version}")
+                    print(f"  严重级别: {vuln.severity.value}")
+                    print(f"  描述: {vuln.description}")
+                    if vuln.fixed_version:
+                        print(f"  修复版本: {vuln.fixed_version}")
         else:
             print("\n✅ 未发现已知安全漏洞")
     
@@ -1842,6 +1870,87 @@ def cmd_readme(args):
         print(markdown)
 
 
+def cmd_simulate(args):
+    """升级影响模拟（dry-run）"""
+    package = args.package
+    target_version = args.target_version
+    project_path = getattr(args, 'project', None)
+
+    print(f"正在模拟升级 {package} -> {target_version}")
+    print("=" * 70)
+
+    # 构建 deps_data
+    if project_path:
+        packages, edges, ecosystem = parse_dependencies(project_path)
+        deps_data = _to_deps_data(packages, edges)
+    else:
+        # 无项目路径：用空 deps_data，仅基于版本号判定风险
+        deps_data = {"packages": [], "edges": []}
+        ecosystem = "pypi"
+
+    import simulator
+    result = simulator.simulate_upgrade(
+        deps_data, package, target_version, ecosystem=ecosystem
+    )
+
+    output_file = getattr(args, 'output', None)
+    if output_file:
+        out_path = Path(output_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open('w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print(f"模拟结果已写入: {output_file}")
+    else:
+        print(simulator.format_simulation_report(result))
+
+
+def cmd_monitor(args):
+    """漏洞持续监控"""
+    project_path = args.project
+    cron_schedule = getattr(args, 'cron', None)
+    webhook_url = getattr(args, 'webhook', None)
+
+    import monitor
+
+    # --cron 模式：只生成 crontab 条目，不实际安装
+    if cron_schedule:
+        entry = monitor.generate_cron_entry(cron_schedule, project_path)
+        print("crontab 条目（需手动安装到 crontab -e）：")
+        print(entry)
+        return
+
+    print(f"正在监控项目: {project_path}")
+    print("=" * 70)
+
+    # 执行扫描
+    scan_result = monitor.run_scan(project_path)
+    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(scan_result['timestamp']))
+    print(f"扫描时间: {ts}")
+    print(f"漏洞总数: {scan_result['total']}")
+
+    # 对比历史
+    history_file = monitor.DEFAULT_HISTORY_FILE
+    new_vulns = monitor.compare_with_history(scan_result, history_file)
+
+    if new_vulns:
+        print(f"\n🚨 检测到 {len(new_vulns)} 个新漏洞:")
+        print(monitor.format_alert(new_vulns))
+
+        # webhook 告警
+        if webhook_url:
+            success = monitor.send_alert(webhook_url, new_vulns)
+            if success:
+                print(f"\n✅ webhook 告警已发送到 {webhook_url}")
+            else:
+                print(f"\n❌ webhook 告警发送失败（见日志）")
+    else:
+        print("\n✅ 无新漏洞")
+
+    # 保存到历史
+    monitor.save_scan_to_history(scan_result, history_file)
+    print(f"\n扫描结果已保存到历史: {history_file}")
+
+
 def main():
     """主函数 - 命令行入口"""
     parser = argparse.ArgumentParser(
@@ -1912,6 +2021,8 @@ def main():
     # security 命令
     security_parser = subparsers.add_parser("security", help="检查安全漏洞")
     security_parser.add_argument("package", help="包名")
+    security_parser.add_argument("--priority", action="store_true",
+                                  help="按修复优先级排序（CVSS × 0.5 + exploit × 0.3 + business × 0.2）")
     
     # report 命令
     report_parser = subparsers.add_parser("report", help="生成完整报告（支持 json/html/pdf/sbom 格式）")
@@ -1932,7 +2043,24 @@ def main():
     readme_parser.add_argument("project", help="项目路径或依赖文件路径")
     readme_parser.add_argument("-o", "--output", default=None,
                                help="可选: markdown 输出路径（默认输出到 stdout）")
-    
+
+    # simulate 命令
+    simulate_parser = subparsers.add_parser("simulate", help="升级影响模拟（dry-run）")
+    simulate_parser.add_argument("package", help="待升级的包名")
+    simulate_parser.add_argument("target_version", help="目标版本号")
+    simulate_parser.add_argument("--project", default=None,
+                                  help="项目路径（用于分析现有依赖图，可选）")
+    simulate_parser.add_argument("-o", "--output", default=None,
+                                  help="可选: JSON 输出路径（默认输出到 stdout）")
+
+    # monitor 命令
+    monitor_parser = subparsers.add_parser("monitor", help="漏洞持续监控")
+    monitor_parser.add_argument("project", help="项目路径")
+    monitor_parser.add_argument("--cron", default=None,
+                                  help="生成 crontab 条目（如 '0 9 * * *'），不实际安装")
+    monitor_parser.add_argument("--webhook", default=None,
+                                  help="webhook URL，检测到新漏洞时 POST 告警")
+
     args = parser.parse_args()
     
     if not args.command:
@@ -1949,6 +2077,8 @@ def main():
         "report": cmd_report,
         "health": cmd_health,
         "readme": cmd_readme,
+        "simulate": cmd_simulate,
+        "monitor": cmd_monitor,
     }
     
     commands[args.command](args)
