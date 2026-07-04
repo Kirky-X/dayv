@@ -89,7 +89,10 @@ class RequestClient:
                     return response
 
             except httpx.HTTPStatusError as e:
-                # 4xx/5xx 错误，不重试
+                # 429 (Too Many Requests) 是限流，可重试；其他 4xx/5xx 不重试
+                if e.response.status_code == 429 and attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
                 raise
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 if attempt < MAX_RETRIES - 1:

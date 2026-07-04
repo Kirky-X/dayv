@@ -9,6 +9,7 @@ import json
 import re
 import sys
 from typing import Optional
+from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
@@ -189,7 +190,7 @@ def get_package(group_id: str, artifact_id: str) -> dict:
     Returns:
         依赖信息字典
     """
-    url = f"{MAVEN_BASE_URL}/artifact/{group_id}/{artifact_id}"
+    url = f"{MAVEN_BASE_URL}/artifact/{quote(group_id, safe='')}/{quote(artifact_id, safe='')}"
     html = fetch_html(url)
     return parse_package_info(html, group_id, artifact_id)
 
@@ -204,7 +205,7 @@ def search_packages(keyword: str) -> dict:
     Returns:
         搜索结果字典
     """
-    url = f"{MAVEN_BASE_URL}/search?q={keyword}"
+    url = f"{MAVEN_BASE_URL}/search?q={quote(keyword, safe='')}"
     html = fetch_html(url)
     return parse_search_results(html)
 

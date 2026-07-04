@@ -7,10 +7,9 @@ crates.io (Rust) 包查询脚本
 import json
 import sys
 from typing import Optional
+from urllib.parse import quote
 
-from bs4 import BeautifulSoup
-
-from utils import fetch_html, fetch_json
+from utils import fetch_json
 
 
 # crates.io 基础 URL
@@ -62,9 +61,6 @@ def parse_package_info(data: dict) -> dict:
     # 主页
     homepage = crate.get("homepage", "") or crate.get("documentation", "")
 
-    # 总下载量
-    downloads = crate.get("downloads", 0)
-
     return {
         "name": name,
         "description": description,
@@ -74,7 +70,6 @@ def parse_package_info(data: dict) -> dict:
         "download_url": download_url,
         "license": license,
         "homepage": homepage,
-        "downloads": downloads,
     }
 
 
@@ -118,50 +113,9 @@ def get_package(crate_name: str) -> dict:
         包信息字典
     """
     # 获取包基本信息（包含版本列表）
-    url = f"{CRATES_API_URL}/crates/{crate_name}"
+    url = f"{CRATES_API_URL}/crates/{quote(crate_name, safe='')}"
     data = fetch_json(url)
-
-    crate = data.get("crate", {})
-    name = crate.get("name", "")
-    description = crate.get("description", "")
-
-    # 获取版本列表
-    versions_data = data.get("versions", [])
-    versions = []
-    for v in versions_data[:20]:  # 最多20个版本
-        versions.append({
-            "version": v.get("num", ""),
-            "date": v.get("created_at", "")[:10] if v.get("created_at") else "",
-        })
-
-    # 获取最新版本信息
-    latest_version = crate.get("newest_version", "") or crate.get("max_version", "")
-
-    # 尝试从 versions 数组获取最新版本的许可证
-    license = ""
-    if versions_data:
-        license = versions_data[0].get("license", "") if versions_data else ""
-
-    # 下载 URL
-    download_url = f"{CRATES_BASE_URL}/api/v1/crates/{name}"
-
-    # 主页
-    homepage = crate.get("homepage", "") or crate.get("documentation", "")
-
-    # 总下载量
-    downloads = crate.get("downloads", 0)
-
-    return {
-        "name": name,
-        "description": description,
-        "latest_version": latest_version,
-        "versions": versions,
-        "dependencies": {},  # 依赖需要单独 API 获取，此处简化
-        "download_url": download_url,
-        "license": license,
-        "homepage": homepage,
-        "downloads": downloads,
-    }
+    return parse_package_info(data)
 
 
 def search_packages(keyword: str) -> dict:
@@ -174,7 +128,7 @@ def search_packages(keyword: str) -> dict:
     Returns:
         搜索结果字典
     """
-    url = f"{CRATES_API_URL}/crates?page=1&per_page=10&q={keyword}"
+    url = f"{CRATES_API_URL}/crates?page=1&per_page=10&q={quote(keyword, safe='')}"
     data = fetch_json(url)
     return parse_search_results(data)
 

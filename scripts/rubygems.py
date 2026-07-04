@@ -6,12 +6,16 @@ API 文档: https://guides.rubygems.org/rubygems-org-api/
 """
 
 import json
+import logging
 import sys
 from typing import Optional
 from urllib.parse import quote
 
 from utils import fetch_json
 
+
+# 配置日志
+logger = logging.getLogger(__name__)
 
 # RubyGems API 基础 URL
 RUBYGEMS_API_URL = "https://rubygems.org/api/v1"
@@ -95,14 +99,32 @@ def get_package(gem_name: str) -> dict:
     """
     获取 RubyGems 包详情
 
+    RubyGems 主端点 /api/v1/gems/{name}.json 不返回 dependencies 字段，
+    需额外请求 /api/v1/gems/{name}/dependencies.json 获取依赖并合并。
+
     Args:
         gem_name: gem 名称
 
     Returns:
         包信息字典
     """
-    url = f"{RUBYGEMS_API_URL}/gems/{quote(gem_name)}.json"
+    url = f"{RUBYGEMS_API_URL}/gems/{quote(gem_name, safe='')}.json"
     data = fetch_json(url)
+
+    # 额外获取 dependencies（主端点不返回）
+    # RubyGems dependencies API 返回 {"dependencies": [...runtime...], "development": [...]}
+    # parse_package_info 期望 data["dependencies"] 是 {"runtime": [...], "development": [...]}
+    deps_url = f"{RUBYGEMS_API_URL}/gems/{quote(gem_name, safe='')}/dependencies.json"
+    try:
+        deps_data = fetch_json(deps_url)
+        if isinstance(deps_data, dict):
+            data["dependencies"] = {
+                "runtime": deps_data.get("dependencies", []),
+                "development": deps_data.get("development", []),
+            }
+    except Exception as e:
+        logger.warning(f"获取 {gem_name} dependencies 失败: {e}")
+
     return parse_package_info(data)
 
 

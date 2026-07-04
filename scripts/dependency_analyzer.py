@@ -312,7 +312,7 @@ class DependencyGraphDB:
                     package: $package,
                     affected_version: $affected_version,
                     severity: $severity,
-                    description: $description, 
+                    description: $description,
                     fixed_version: $fixed_version
                 })
             """, {
@@ -323,16 +323,17 @@ class DependencyGraphDB:
                 "description": vuln.description,
                 "fixed_version": vuln.fixed_version or ""
             })
-            
-            if vuln.fixed_version:
-                self.conn.execute("""
-                    MATCH (v:Vulnerability {cve_id: $cve_id}), 
-                          (p:Package {name: $package})
-                    CREATE (v)-[:Affects]->(p)
-                """, {
-                    "cve_id": vuln.cve_id,
-                    "package": vuln.package
-                })
+
+            # 无论是否有 fixed_version，都必须建立 Affects 关系
+            # 否则 assess_security (MATCH (v)-[:Affects]->(p)) 会漏掉无 fix 的漏洞
+            self.conn.execute("""
+                MATCH (v:Vulnerability {cve_id: $cve_id}),
+                      (p:Package {name: $package})
+                CREATE (v)-[:Affects]->(p)
+            """, {
+                "cve_id": vuln.cve_id,
+                "package": vuln.package
+            })
             return True
         except Exception as e:
             logger.error(f"添加漏洞失败: {e}")
@@ -457,9 +458,12 @@ class DependencyGraphDB:
         """关闭数据库连接"""
         try:
             self.conn.close()
+        except Exception as e:
+            logger.warning(f"关闭 Connection 失败: {e}")
+        try:
             self.db.close()
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"关闭 Database 失败: {e}")
 
 
 class DependencyAnalyzer:
@@ -1139,21 +1143,52 @@ def parse_dependencies(project_path: str) -> tuple[List[DependencyNode], List[De
         logger.info("  Node.js: package.json")
         logger.info("  Java: pom.xml, build.gradle")
         logger.info("  Rust: Cargo.toml")
-        logger.info("  Go: go.mod")
+        logger.info("  Ruby: Gemfile")
+        logger.info("  PHP: composer.json")
+        logger.info("  .NET: *.csproj, *.fsproj, *.vbproj")
+        logger.info("注: Go 和 C/C++ 无中央 registry，不在支持列表")
         sys.exit(1)
-    
+
     filename = Path(dep_file).name
-    
+
     # 根据文件名选择解析器
+    # 注：detect_dependency_file 可识别 Gemfile/composer.json/.csproj 等，
+    # 但 parsers 暂未实现自动解析。命中这些文件时下方会显式提示用户改用 query/search 子命令。
     parsers = {
         "pyproject.toml": (parse_pyproject_toml, "pypi"),
         "package.json": (parse_package_json, "npm"),
         "requirements.txt": (parse_requirements_txt, "pypi"),
     }
-    
+
     if filename not in parsers:
-        logger.warning(f"暂不支持自动解析 {filename}")
-        logger.info("提示: 目前支持 pyproject.toml, package.json, requirements.txt")
+        # 检查是否是 detect 支持但 parser 未实现的文件
+        detect_supported_but_unparsed = {
+            "pom.xml": "maven",
+            "build.gradle": "maven",
+            "build.gradle.kts": "maven",
+            "Cargo.toml": "crates",
+            "Gemfile": "rubygems",
+            "composer.json": "packagist",
+        }
+        # 也检查 .csproj/.fsproj/.vbproj 扩展名
+        suffix = Path(filename).suffix.lower()
+        if suffix in (".csproj", ".fsproj", ".vbproj"):
+            ecosystem_hint = "nuget"
+        else:
+            ecosystem_hint = detect_supported_but_unparsed.get(filename)
+
+        if ecosystem_hint:
+            logger.warning(
+                f"已检测到 {filename}（ecosystem={ecosystem_hint}），"
+                f"但自动解析器暂未实现。"
+            )
+            logger.info(
+                f"请改用 query/search 子命令手动查询: "
+                f"python dependency_analyzer.py query <pkg> -e {ecosystem_hint}"
+            )
+        else:
+            logger.warning(f"暂不支持自动解析 {filename}")
+            logger.info("提示: 目前支持自动解析 pyproject.toml, package.json, requirements.txt")
         sys.exit(1)
     
     parse_func, ecosystem = parsers[filename]
@@ -1483,26 +1518,50 @@ def cmd_search(args):
 def cmd_security(args):
     """检查安全漏洞"""
     package_name = args.package
-    
+
     print(f"正在检查包安全漏洞: {package_name}")
     print("=" * 70)
-    
+
+    # 查询包真实最新版本（避免用假版本导致 false positive）
+    latest_version = None
+    try:
+        import json as _json
+        import subprocess as _sp
+        script_path = Path(__file__).parent / "pypi.py"
+        result = _sp.run(
+            [sys.executable, str(script_path), package_name],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            pkg_info = _json.loads(result.stdout)
+            latest_version = pkg_info.get("latest_version", "")
+    except Exception as e:
+        logger.warning(f"查询 {package_name} 最新版本失败: {e}")
+
+    if not latest_version:
+        print(f"\n⚠️ 无法获取 {package_name} 的最新版本（网络不可用或包不存在）")
+        print("   跳过漏洞检查：使用假版本会导致 false positive 报告。")
+        print("   请检查网络连接或确认包名后重试。")
+        return
+
+    print(f"最新版本: {latest_version}")
+
     # 创建临时分析器
     analyzer = DependencyAnalyzer()
-    
+
     try:
-        # 添加包
+        # 用真实版本创建 DependencyNode
         pkg = DependencyNode(
             name=package_name,
-            version="0.0.0",  # 实际应该查询最新版本
+            version=latest_version,
             ecosystem="pypi"
         )
-        
+
         packages = [pkg]
         edges = []
-        
+
         analyzer.build_dependency_graph(packages, edges)
-        
+
         # 检查漏洞
         vulns = analyzer.assess_security()
         

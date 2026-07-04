@@ -8,6 +8,7 @@ import json
 import re
 import sys
 from typing import Optional
+from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
@@ -174,7 +175,7 @@ def get_package(package_name: str) -> dict:
     Returns:
         包信息字典
     """
-    url = f"{PYPI_BASE_URL}/project/{package_name}/"
+    url = f"{PYPI_BASE_URL}/project/{quote(package_name, safe='')}/"
     html = fetch_html(url)
     return parse_package_info(html, package_name)
 
@@ -189,7 +190,7 @@ def search_packages(keyword: str) -> dict:
     Returns:
         搜索结果字典
     """
-    url = f"{PYPI_BASE_URL}/search/?q={keyword}"
+    url = f"{PYPI_BASE_URL}/search/?q={quote(keyword, safe='')}"
     html = fetch_html(url)
     return parse_search_results(html)
 

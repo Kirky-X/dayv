@@ -9,6 +9,7 @@ NuGet V3 API 要求 package id 在 URL 中全小写。
 import json
 import sys
 from typing import Optional
+from urllib.parse import quote
 
 from utils import fetch_json
 
@@ -147,9 +148,9 @@ def get_package(package_name: str) -> dict:
     Returns:
         包信息字典（name 保留原始大小写）
     """
-    # URL 中强制小写
-    lower_name = package_name.lower()
-    url = f"{NUGET_REGISTRATION_URL}/{lower_name}/index.json"
+    # URL 中强制小写并 URL encode（NuGet V3 API 要求 package id 全小写）
+    encoded_name = quote(package_name.lower(), safe='')
+    url = f"{NUGET_REGISTRATION_URL}/{encoded_name}/index.json"
     data = fetch_json(url)
     return parse_package_info(data)
 
@@ -164,7 +165,7 @@ def search_packages(keyword: str) -> dict:
     Returns:
         搜索结果字典
     """
-    url = f"{NUGET_SEARCH_URL}/query?q={keyword}"
+    url = f"{NUGET_SEARCH_URL}/query?q={quote(keyword, safe='')}"
     data = fetch_json(url)
     return parse_search_results(data)
 
