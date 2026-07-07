@@ -5,7 +5,6 @@ specmark/
 tests/
 **/tests/
 **/test/
-
 # Python 缓存
 __pycache__/
 *.py[cod]
@@ -13,7 +12,6 @@ __pycache__/
 *.so
 .Python
 .pytest_cache/
-
 # OS
 .DS_Store
 .DS_Store?
@@ -22,22 +20,23 @@ __pycache__/
 .Trashes
 ehthumbs.db
 Thumbs.db
-
 # IDE
 .vscode
 .idea
 *.swp
 *.swo
 *~
-
 # 环境变量
 .env
 .env.local
 .env.*.local
-
 # 日志
 *.log
-
-
 # Darwin skill 优化产物（开发期使用，不入仓库）
 test-prompts.json
+# Python cache
+*.pyc
+.ruff_cache/
+# Specmark/openspec 临时产物
+openspec/
+results.tsv

@@ -6,16 +6,16 @@ Dependency Analysis Engine - 依赖分析引擎
 使用方式:
   # 分析项目依赖
   python dependency_analyzer.py analyze /path/to/project
-  
+
   # 查询包依赖
   python dependency_analyzer.py query <package-name>
-  
+
   # 搜索包
   python dependency_analyzer.py search <keyword>
-  
+
   # 检查安全漏洞
   python dependency_analyzer.py security <package-name>
-  
+
   # 生成完整报告
   python dependency_analyzer.py report /path/to/project -o report.json
 """
@@ -36,12 +36,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import real_ladybug as lb
 
 from utils import (
+    RequestClient,
     check_version_constraint,
     compare_versions,
     find_latest_version,
     is_valid_semver,
     sort_versions,
 )
+from vulnerability_prioritizer import parse_cvss_v3_base_score
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -51,9 +53,39 @@ MAX_CYCLES_DETECT = 100
 MAX_PATHS_FIND = 10
 MAX_RECOMMENDATIONS_DISPLAY = 20
 
+# ============ OSV 漏洞数据库集成 ============
+# OSV batch query API（官方文档：https://google.github.io/osv.dev/post-v1-querybatch/）
+# 注：任务原文写 "/v1/query"，但 OSV 的真正 batch 端点是 "/v1/querybatch"
+# （单包端点 /v1/query 不支持批量提交）。按"batch 提交"意图采用 /v1/querybatch。
+OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+OSV_BATCH_CHUNK = 250  # OSV querybatch 上限 1000，保守分片
+
+# 内部 ecosystem 标识 → OSV ecosystem 名（https://ossf.github.io/osv-schema/）
+OSV_ECOSYSTEM_MAP = {
+    "pypi": "PyPI",
+    "npm": "npm",
+    "maven": "Maven",
+    "crates": "crates.io",
+    "rubygems": "RubyGems",
+    "packagist": "Packagist",
+    "nuget": "NuGet",
+}
+
+
+def _severity_from_cvss(score: float) -> "SeverityLevel":
+    """按 CVSS v3 标准分档把数值分映射到 SeverityLevel（确定性判断）。"""
+    if score >= 9.0:
+        return SeverityLevel.CRITICAL
+    if score >= 7.0:
+        return SeverityLevel.HIGH
+    if score >= 4.0:
+        return SeverityLevel.MEDIUM
+    return SeverityLevel.LOW
+
 
 class SeverityLevel(Enum):
     """严重级别"""
+
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -63,6 +95,7 @@ class SeverityLevel(Enum):
 @dataclass
 class DependencyNode:
     """依赖节点"""
+
     name: str
     version: str
     ecosystem: str  # pypi, npm, maven, crates
@@ -73,6 +106,7 @@ class DependencyNode:
 @dataclass
 class DependencyEdge:
     """依赖边"""
+
     source: str
     target: str
     constraint: str
@@ -83,6 +117,7 @@ class DependencyEdge:
 @dataclass
 class ConflictInfo:
     """冲突信息"""
+
     package: str
     required_by: List[Dict[str, str]]
     conflict_type: str
@@ -93,6 +128,7 @@ class ConflictInfo:
 @dataclass
 class SecurityVulnerability:
     """安全漏洞"""
+
     package: str
     version: str
     severity: SeverityLevel
@@ -100,11 +136,15 @@ class SecurityVulnerability:
     description: str
     fixed_version: Optional[str] = None
     references: List[str] = field(default_factory=list)
+    # OSV 真实 CVSS 数据（来自 severity[].score，供 prioritizer 精确评分）
+    cvss_vector: Optional[str] = None
+    cvss_score: Optional[float] = None
 
 
 @dataclass
 class UpdatePath:
     """更新路径"""
+
     package: str
     current_version: str
     target_version: str
@@ -116,6 +156,7 @@ class UpdatePath:
 @dataclass
 class AnalysisReport:
     """分析报告"""
+
     timestamp: float
     root_package: str
     total_packages: int
@@ -125,31 +166,185 @@ class AnalysisReport:
     update_paths: List[UpdatePath]
     recommendations: List[str]
     graph_stats: Dict[str, Any]
+    # 漏洞扫描状态告警（如 OSV 请求失败时显式标注"未扫描"，避免静默谎报"无漏洞"）
+    scan_warnings: List[str] = field(default_factory=list)
+
+
+# ============ OSV 响应解析（纯函数，便于离线单测） ============
+
+
+def _build_osv_queries(
+    packages: List[DependencyNode],
+) -> Tuple[List[Dict[str, Any]], List[DependencyNode], List[str]]:
+    """把 DependencyNode 列表转成 OSV querybatch 的 queries 数组。
+
+    Returns:
+        (queries, index, skipped)
+        - queries: 与 index 等长对齐的 OSV query 列表
+        - index: 实际提交查询的包（与 queries[k] 一一对应）
+        - skipped: 被跳过的包描述（生态系统未映射 / 无版本）
+    """
+    queries: List[Dict[str, Any]] = []
+    index: List[DependencyNode] = []
+    skipped: List[str] = []
+    for pkg in packages:
+        osv_eco = OSV_ECOSYSTEM_MAP.get(pkg.ecosystem)
+        if osv_eco is None:
+            skipped.append(f"{pkg.name}@{pkg.version} (ecosystem={pkg.ecosystem})")
+            continue
+        if not pkg.version:
+            skipped.append(f"{pkg.name} (无版本，OSV 无法判定受影响范围)")
+            continue
+        queries.append(
+            {
+                "package": {"ecosystem": osv_eco, "name": pkg.name},
+                "version": pkg.version,
+            }
+        )
+        index.append(pkg)
+    return queries, index, skipped
+
+
+def _parse_osv_results(
+    index: List[DependencyNode], results: List[Dict[str, Any]]
+) -> List[SecurityVulnerability]:
+    """把 OSV querybatch 响应映射为 SecurityVulnerability 列表。
+
+    results 与 index 等长对齐：results[k] 对应 index[k] 这个包的查询结果。
+    """
+    vulns: List[SecurityVulnerability] = []
+    for k, pkg in enumerate(index):
+        result = results[k] if k < len(results) else {}
+        if not isinstance(result, dict):
+            continue
+        for v in result.get("vulns", []) or []:
+            parsed = _parse_one_osv_vuln(v, pkg)
+            if parsed is not None:
+                vulns.append(parsed)
+    return vulns
+
+
+def _parse_one_osv_vuln(
+    vuln: Dict[str, Any], pkg: DependencyNode
+) -> Optional[SecurityVulnerability]:
+    """解析单个 OSV vuln → SecurityVulnerability。
+
+    提取：CVE id（优先 CVE 别名）、CVSS v3 vector + base score、severity 档位、
+    fixed_version（来自 affected[].ranges[].events[].fixed）、references。
+    """
+    if not isinstance(vuln, dict):
+        return None
+
+    # 1. cve_id：优先 CVE 别名，否则用 OSV id（如 GHSA-*）
+    cve_id = vuln.get("id", "") or ""
+    for alias in vuln.get("aliases", []) or []:
+        if isinstance(alias, str) and alias.upper().startswith("CVE-"):
+            cve_id = alias
+            break
+
+    # 2. CVSS v3 vector：从 severity[] 取首个 CVSS:3.x
+    cvss_vector: Optional[str] = None
+    for entry in vuln.get("severity", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        score = entry.get("score")
+        if isinstance(score, str) and score.startswith("CVSS:3"):
+            cvss_vector = score
+            break
+
+    # 3. CVSS base score：优先解析 vector（真实计算），否则回退 database_specific.cvss
+    cvss_score: Optional[float] = None
+    if cvss_vector:
+        parsed = parse_cvss_v3_base_score(cvss_vector)
+        if parsed is not None:
+            cvss_score = parsed
+    if cvss_score is None:
+        ds = vuln.get("database_specific") or {}
+        cvss_field = ds.get("cvss") if isinstance(ds, dict) else None
+        if isinstance(cvss_field, dict):
+            raw = cvss_field.get("score")
+            if isinstance(raw, (int, float)) and 0 <= raw <= 10:
+                cvss_score = float(raw)
+        elif isinstance(cvss_field, (int, float)) and 0 <= cvss_field <= 10:
+            cvss_score = float(cvss_field)
+
+    # 4. severity 档位：CVSS 数值 → 标准 CVSS 分档；无数值时回退文本
+    if cvss_score is not None:
+        severity = _severity_from_cvss(cvss_score)
+    else:
+        ds = vuln.get("database_specific") or {}
+        sev_text = (ds.get("severity", "") if isinstance(ds, dict) else "").upper()
+        sev_map = {
+            "CRITICAL": SeverityLevel.CRITICAL,
+            "HIGH": SeverityLevel.HIGH,
+            "MODERATE": SeverityLevel.MEDIUM,
+            "MEDIUM": SeverityLevel.MEDIUM,
+            "LOW": SeverityLevel.LOW,
+        }
+        # 无 CVSS 时默认 MEDIUM（不谎称 low 以免低估）
+        severity = sev_map.get(sev_text, SeverityLevel.MEDIUM)
+
+    # 5. fixed_version：扫描 affected[].ranges[].events[].fixed 取首个
+    fixed_version: Optional[str] = None
+    for aff in vuln.get("affected", []) or []:
+        if not isinstance(aff, dict):
+            continue
+        for rng in aff.get("ranges", []) or []:
+            if not isinstance(rng, dict):
+                continue
+            for ev in rng.get("events", []) or []:
+                if isinstance(ev, dict) and ev.get("fixed"):
+                    fixed_version = str(ev["fixed"])
+                    break
+            if fixed_version:
+                break
+        if fixed_version:
+            break
+
+    # 6. references
+    references: List[str] = []
+    for ref in vuln.get("references", []) or []:
+        if isinstance(ref, dict) and isinstance(ref.get("url"), str):
+            references.append(ref["url"])
+
+    description = vuln.get("summary") or vuln.get("details") or ""
+
+    return SecurityVulnerability(
+        package=pkg.name,
+        version=pkg.version,
+        severity=severity,
+        cve_id=cve_id,
+        description=description,
+        fixed_version=fixed_version,
+        references=references,
+        cvss_vector=cvss_vector,
+        cvss_score=cvss_score,
+    )
 
 
 class DependencyGraphDB:
     """基于 Ladybug 的依赖关系图数据库"""
-    
+
     def __init__(self, db_path: Optional[str] = None):
         """
         初始化图数据库
-        
+
         Args:
             db_path: 数据库文件路径，None 则使用临时文件
         """
         if db_path is None:
             temp_dir = tempfile.mkdtemp(prefix="ladybug_dep_")
             db_path = str(Path(temp_dir) / "deps.db")
-        
+
         # 确保父目录存在
         db_path_obj = Path(db_path)
         db_path_obj.parent.mkdir(parents=True, exist_ok=True)
-        
+
         self.db_path = db_path
         self.db = lb.Database(db_path)
         self.conn = lb.Connection(self.db)
         self._init_schema()
-    
+
     def _init_schema(self):
         """初始化图数据库模式"""
         # 创建包节点表（使用 name 作为主键，version 和 ecosystem 作为属性）
@@ -166,7 +361,7 @@ class DependencyGraphDB:
                 PRIMARY KEY (name)
             )
         """)
-        
+
         # 创建依赖关系表
         self.conn.execute("""
             CREATE REL TABLE DependsOn(
@@ -176,7 +371,7 @@ class DependencyGraphDB:
                 is_optional BOOL
             )
         """)
-        
+
         # 创建冲突关系表
         self.conn.execute("""
             CREATE REL TABLE ConflictsWith(
@@ -185,7 +380,7 @@ class DependencyGraphDB:
                 severity STRING
             )
         """)
-        
+
         # 创建漏洞表
         self.conn.execute("""
             CREATE NODE TABLE Vulnerability(
@@ -195,33 +390,36 @@ class DependencyGraphDB:
                 severity STRING,
                 description STRING,
                 fixed_version STRING,
+                cvss_vector STRING,
+                cvss_score DOUBLE,
                 PRIMARY KEY (cve_id)
             )
         """)
-        
+
         # 创建漏洞影响关系
         self.conn.execute("""
             CREATE REL TABLE Affects(
                 FROM Vulnerability TO Package
             )
         """)
-    
+
     def add_package(self, package: DependencyNode) -> bool:
         """
         添加包节点
-        
+
         Args:
             package: 包节点信息
-            
+
         Returns:
             是否成功
         """
         try:
             is_root = "TRUE" if package.is_root else "FALSE"
             downloads = package.properties.get("downloads", 0)
-            
+
             # 使用参数化查询防止 SQL 注入
-            self.conn.execute("""
+            self.conn.execute(
+                """
                 CREATE (p:Package {
                     name: $name, 
                     version: $version, 
@@ -232,183 +430,208 @@ class DependencyGraphDB:
                     homepage: $homepage, 
                     download_count: $downloads
                 })
-            """, {
-                "name": package.name,
-                "version": package.version,
-                "ecosystem": package.ecosystem,
-                "is_root": package.is_root,
-                "description": package.properties.get("description", ""),
-                "license": package.properties.get("license", ""),
-                "homepage": package.properties.get("homepage", ""),
-                "downloads": downloads
-            })
+            """,
+                {
+                    "name": package.name,
+                    "version": package.version,
+                    "ecosystem": package.ecosystem,
+                    "is_root": package.is_root,
+                    "description": package.properties.get("description", ""),
+                    "license": package.properties.get("license", ""),
+                    "homepage": package.properties.get("homepage", ""),
+                    "downloads": downloads,
+                },
+            )
             return True
         except Exception as e:
             logger.error(f"添加包失败 {package.name}@{package.version}: {e}")
             return False
-    
+
     def add_dependency(self, edge: DependencyEdge) -> bool:
         """
         添加依赖关系
-        
+
         Args:
             edge: 依赖边信息
-            
+
         Returns:
             是否成功
         """
         try:
             is_optional = edge.edge_type == "optional"
-            
+
             # 使用参数化查询防止 SQL 注入
-            self.conn.execute("""
+            self.conn.execute(
+                """
                 MATCH (s:Package {name: $source}), (t:Package {name: $target})
                 CREATE (s)-[:DependsOn {
                     constraint: $constraint,
                     edge_type: $edge_type,
                     is_optional: $is_optional
                 }]->(t)
-            """, {
-                "source": edge.source,
-                "target": edge.target,
-                "constraint": edge.constraint,
-                "edge_type": edge.edge_type,
-                "is_optional": is_optional
-            })
+            """,
+                {
+                    "source": edge.source,
+                    "target": edge.target,
+                    "constraint": edge.constraint,
+                    "edge_type": edge.edge_type,
+                    "is_optional": is_optional,
+                },
+            )
             return True
         except Exception as e:
             logger.error(f"添加依赖失败 {edge.source} -> {edge.target}: {e}")
             return False
-    
+
     def add_conflict(self, pkg1: str, pkg2: str, reason: str, severity: str) -> bool:
         """添加冲突关系"""
         try:
             # 使用参数化查询防止 SQL 注入
-            self.conn.execute("""
+            self.conn.execute(
+                """
                 MATCH (p1:Package), (p2:Package)
                 WHERE p1.name = $pkg1 AND p2.name = $pkg2
                 CREATE (p1)-[:ConflictsWith {
                     reason: $reason,
                     severity: $severity
                 }]->(p2)
-            """, {
-                "pkg1": pkg1,
-                "pkg2": pkg2,
-                "reason": reason,
-                "severity": severity
-            })
+            """,
+                {"pkg1": pkg1, "pkg2": pkg2, "reason": reason, "severity": severity},
+            )
             return True
         except Exception as e:
             logger.error(f"添加冲突失败: {e}")
             return False
-    
+
     def add_vulnerability(self, vuln: SecurityVulnerability) -> bool:
         """添加安全漏洞"""
         try:
             # 使用参数化查询防止 SQL 注入
-            self.conn.execute("""
+            self.conn.execute(
+                """
                 CREATE (v:Vulnerability {
                     cve_id: $cve_id,
                     package: $package,
                     affected_version: $affected_version,
                     severity: $severity,
                     description: $description,
-                    fixed_version: $fixed_version
+                    fixed_version: $fixed_version,
+                    cvss_vector: $cvss_vector,
+                    cvss_score: $cvss_score
                 })
-            """, {
-                "cve_id": vuln.cve_id,
-                "package": vuln.package,
-                "affected_version": vuln.version,
-                "severity": vuln.severity.value,
-                "description": vuln.description,
-                "fixed_version": vuln.fixed_version or ""
-            })
+            """,
+                {
+                    "cve_id": vuln.cve_id,
+                    "package": vuln.package,
+                    "affected_version": vuln.version,
+                    "severity": vuln.severity.value,
+                    "description": vuln.description,
+                    "fixed_version": vuln.fixed_version or "",
+                    "cvss_vector": vuln.cvss_vector or "",
+                    "cvss_score": vuln.cvss_score
+                    if vuln.cvss_score is not None
+                    else -1.0,
+                },
+            )
 
             # 无论是否有 fixed_version，都必须建立 Affects 关系
             # 否则 assess_security (MATCH (v)-[:Affects]->(p)) 会漏掉无 fix 的漏洞
-            self.conn.execute("""
+            self.conn.execute(
+                """
                 MATCH (v:Vulnerability {cve_id: $cve_id}),
                       (p:Package {name: $package})
                 CREATE (v)-[:Affects]->(p)
-            """, {
-                "cve_id": vuln.cve_id,
-                "package": vuln.package
-            })
+            """,
+                {"cve_id": vuln.cve_id, "package": vuln.package},
+            )
             return True
         except Exception as e:
             logger.error(f"添加漏洞失败: {e}")
             return False
-    
+
     def query_dependencies(self, package_name: str) -> List[Dict[str, Any]]:
         """
         查询包的依赖
-        
+
         Args:
             package_name: 包名
-            
+
         Returns:
             依赖列表
         """
         try:
             # 使用参数化查询防止 SQL 注入
-            result = self.conn.execute("""
+            result = self.conn.execute(
+                """
                 MATCH (p:Package)-[d:DependsOn]->(dep:Package)
                 WHERE p.name = $name
                 RETURN p.name, p.version, dep.name, dep.version, 
                        d.constraint, d.edge_type
-            """, {"name": package_name})
-            
+            """,
+                {"name": package_name},
+            )
+
             deps = []
             while result.has_next():
                 row = result.get_next()
-                deps.append({
-                    "source": row[0],
-                    "source_version": row[1],
-                    "target": row[2],
-                    "target_version": row[3],
-                    "constraint": row[4],
-                    "edge_type": row[5],
-                })
+                deps.append(
+                    {
+                        "source": row[0],
+                        "source_version": row[1],
+                        "target": row[2],
+                        "target_version": row[3],
+                        "constraint": row[4],
+                        "edge_type": row[5],
+                    }
+                )
             return deps
         except Exception as e:
             logger.error(f"查询依赖失败: {e}")
             return []
-    
+
     def query_dependents(self, package_name: str) -> List[Dict[str, Any]]:
         """查询哪些包依赖指定包"""
         try:
             # 使用参数化查询防止 SQL 注入
-            result = self.conn.execute("""
+            result = self.conn.execute(
+                """
                 MATCH (p:Package)-[d:DependsOn]->(dep:Package)
                 WHERE dep.name = $name
                 RETURN p.name, p.version, dep.name, dep.version, d.constraint
-            """, {"name": package_name})
-            
+            """,
+                {"name": package_name},
+            )
+
             dependents = []
             while result.has_next():
                 row = result.get_next()
-                dependents.append({
-                    "source": row[0],
-                    "source_version": row[1],
-                    "target": row[2],
-                    "target_version": row[3],
-                    "constraint": row[4],
-                })
+                dependents.append(
+                    {
+                        "source": row[0],
+                        "source_version": row[1],
+                        "target": row[2],
+                        "target_version": row[3],
+                        "constraint": row[4],
+                    }
+                )
             return dependents
         except Exception as e:
             logger.error(f"查询依赖者失败: {e}")
             return []
-    
+
     def find_path(self, from_pkg: str, to_pkg: str) -> List[List[str]]:
         """查找两个包之间的依赖路径"""
         try:
             # 使用参数化查询防止 SQL 注入
-            result = self.conn.execute("""
+            result = self.conn.execute(
+                """
                 MATCH path = (p1:Package {name: $from})-[:DependsOn*]->(p2:Package {name: $to})
                 RETURN path
                 LIMIT $limit
-            """, {"from": from_pkg, "to": to_pkg, "limit": MAX_PATHS_FIND})
-            
+            """,
+                {"from": from_pkg, "to": to_pkg, "limit": MAX_PATHS_FIND},
+            )
+
             paths = []
             while result.has_next():
                 row = result.get_next()
@@ -417,16 +640,19 @@ class DependencyGraphDB:
         except Exception as e:
             logger.error(f"查找路径失败: {e}")
             return []
-    
+
     def detect_cycles(self) -> List[List[str]]:
         """检测循环依赖"""
         try:
-            result = self.conn.execute("""
+            result = self.conn.execute(
+                """
                 MATCH path = (p:Package)-[:DependsOn*]->(p)
                 RETURN path
                 LIMIT $limit
-            """, {"limit": MAX_CYCLES_DETECT})
-            
+            """,
+                {"limit": MAX_CYCLES_DETECT},
+            )
+
             cycles = []
             while result.has_next():
                 row = result.get_next()
@@ -435,15 +661,17 @@ class DependencyGraphDB:
         except Exception as e:
             logger.error(f"检测循环依赖失败: {e}")
             return []
-    
+
     def get_graph_stats(self) -> Dict[str, Any]:
         """获取图统计信息"""
         try:
             pkg_count = self.conn.execute("MATCH (p:Package) RETURN COUNT(p)")
             dep_count = self.conn.execute("MATCH ()-[:DependsOn]->() RETURN COUNT(*)")
-            conflict_count = self.conn.execute("MATCH ()-[:ConflictsWith]->() RETURN COUNT(*)")
+            conflict_count = self.conn.execute(
+                "MATCH ()-[:ConflictsWith]->() RETURN COUNT(*)"
+            )
             vuln_count = self.conn.execute("MATCH (v:Vulnerability) RETURN COUNT(v)")
-            
+
             return {
                 "total_packages": pkg_count.get_next()[0],
                 "total_dependencies": dep_count.get_next()[0],
@@ -453,7 +681,7 @@ class DependencyGraphDB:
         except Exception as e:
             logger.error(f"获取统计信息失败: {e}")
             return {}
-    
+
     def close(self):
         """关闭数据库连接"""
         try:
@@ -468,91 +696,149 @@ class DependencyGraphDB:
 
 class DependencyAnalyzer:
     """依赖分析器"""
-    
-    def __init__(self, db_path: Optional[str] = None):
+
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        http_client: Optional[RequestClient] = None,
+    ):
         """
         初始化分析器
-        
+
         Args:
             db_path: 数据库路径
+            http_client: 可选 HTTP 客户端（测试注入 mock 避免联网）；
+                         默认新建 RequestClient（含重试 + 随机延迟）
         """
         self.db = DependencyGraphDB(db_path)
-        self.known_vulnerabilities = self._load_vulnerability_db()
-    
-    def _load_vulnerability_db(self) -> Dict[str, List[SecurityVulnerability]]:
-        """加载已知漏洞数据库（示例数据）"""
-        # 实际应用中应从安全数据库 API 加载
-        return {
-            # 示例漏洞数据
-            "django": [
-                SecurityVulnerability(
-                    cve_id="CVE-2023-12345",
-                    package="django",
-                    version="<4.2.0",
-                    severity=SeverityLevel.HIGH,
-                    description="SQL injection vulnerability",
-                    fixed_version="4.2.0",
-                )
-            ],
-            "requests": [
-                SecurityVulnerability(
-                    cve_id="CVE-2023-67890",
-                    package="requests",
-                    version="<2.31.0",
-                    severity=SeverityLevel.MEDIUM,
-                    description="Information disclosure",
-                    fixed_version="2.31.0",
-                )
-            ]
+        self._http = http_client or RequestClient(timeout=30.0)
+        # OSV 漏洞扫描状态：未扫描时显式标注，禁止静默谎报"无漏洞"
+        self.osv_scan_status: Dict[str, Any] = {
+            "scanned": False,
+            "reason": "未执行扫描",
         }
-    
-    def build_dependency_graph(self, packages: List[DependencyNode], 
-                               dependencies: List[DependencyEdge]) -> bool:
+
+    def _check_and_add_vulnerabilities(self, packages: List[DependencyNode]):
+        """查询 OSV 批量 API 检查每个包的真实漏洞并写入图。
+
+        失败时显式记录 osv_scan_status（标注"未扫描"），不静默、不注入假漏洞。
+        无网络/超时/解析失败都属于这条显式失败路径。
+        """
+        if not packages:
+            self.osv_scan_status = {"scanned": True, "found": 0}
+            return
+        try:
+            vulns = self._query_osv_batch(packages)
+        except Exception as e:
+            reason = f"OSV 漏洞扫描失败：{type(e).__name__}: {e}"
+            logger.warning(
+                reason + "（漏洞列表可能不完整；报告 scan_warnings 将显式标注）"
+            )
+            self.osv_scan_status = {
+                "scanned": False,
+                "reason": reason,
+                "packages": [f"{p.name}@{p.version}" for p in packages],
+            }
+            return
+        self.osv_scan_status = {"scanned": True, "found": len(vulns)}
+        for vuln in vulns:
+            self.db.add_vulnerability(vuln)
+
+    def _query_osv_batch(
+        self, packages: List[DependencyNode]
+    ) -> List[SecurityVulnerability]:
+        """批量查询 OSV (https://api.osv.dev/v1/querybatch)。
+
+        - ecosystem 映射: pypi→PyPI / npm→npm / maven→Maven / crates→crates.io
+          / rubygems→RubyGems / packagist→Packagist / nuget→NuGet
+        - 提交 package + version，由 OSV 服务端做版本过滤（仅返回受影响漏洞）
+        - 复用 utils.RequestClient 的重试 + 随机延迟限流
+        - 分片提交，每片 OSV_BATCH_CHUNK 个包
+
+        Raises:
+            httpx.HTTPError / ValueError: 网络/HTTP/JSON 解析失败时抛出
+        """
+        queries, index, skipped = _build_osv_queries(packages)
+        if skipped:
+            logger.info(
+                f"OSV 跳过 {len(skipped)} 个包（生态系统未映射或无版本）: {skipped[:5]}"
+            )
+        if not queries:
+            return []
+
+        all_results: List[Dict[str, Any]] = []
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        for i in range(0, len(queries), OSV_BATCH_CHUNK):
+            chunk = queries[i : i + OSV_BATCH_CHUNK]
+            response = self._http.post(
+                OSV_BATCH_URL, json={"queries": chunk}, headers=headers
+            )
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError(f"OSV 响应非 JSON 对象: {type(data).__name__}")
+            chunk_results = data.get("results", [])
+            if not isinstance(chunk_results, list):
+                raise ValueError("OSV 响应 results 字段非列表")
+            # 对齐：OSV 规范保证 results 与 queries 等长（无漏洞的为 {}）
+            all_results.extend(chunk_results)
+            # 翻页：next_page_token 表示同一批查询还有更多漏洞
+            page_token = data.get("next_page_token")
+            while page_token:
+                body = {"queries": chunk, "page_token": page_token}
+                response = self._http.post(OSV_BATCH_URL, json=body, headers=headers)
+                data = response.json()
+                page_results = data.get("results", [])
+                for j, pr in enumerate(page_results):
+                    base = i + j
+                    if base < len(all_results):
+                        all_results[base].setdefault("vulns", []).extend(
+                            pr.get("vulns", []) if isinstance(pr, dict) else []
+                        )
+                page_token = data.get("next_page_token")
+
+        return _parse_osv_results(index, all_results)
+
+    def build_dependency_graph(
+        self, packages: List[DependencyNode], dependencies: List[DependencyEdge]
+    ) -> bool:
         """
         构建依赖关系图
-        
+
         Args:
             packages: 包节点列表
             dependencies: 依赖边列表
-            
+
         Returns:
             是否成功
         """
-        logger.info(f"正在构建依赖图: {len(packages)} 个包, {len(dependencies)} 个依赖关系")
-        
+        logger.info(
+            f"正在构建依赖图: {len(packages)} 个包, {len(dependencies)} 个依赖关系"
+        )
+
         # 添加所有包节点
         for pkg in packages:
             self.db.add_package(pkg)
-        
+
         # 添加所有依赖关系
         for dep in dependencies:
             self.db.add_dependency(dep)
-        
+
         # 添加已知漏洞
         self._check_and_add_vulnerabilities(packages)
-        
+
         logger.info("依赖图构建完成")
         return True
-    
-    def _check_and_add_vulnerabilities(self, packages: List[DependencyNode]):
-        """检查并添加漏洞信息"""
-        for pkg in packages:
-            if pkg.name in self.known_vulnerabilities:
-                for vuln in self.known_vulnerabilities[pkg.name]:
-                    # 检查版本是否受影响
-                    if check_version_constraint(pkg.version, vuln.version):
-                        self.db.add_vulnerability(vuln)
-    
+
     def detect_conflicts(self) -> List[ConflictInfo]:
         """
         检测依赖冲突
-        
+
         Returns:
             冲突列表
         """
         logger.info("检测依赖冲突...")
         conflicts = []
-        
+
         # 查询所有包 - 使用参数化查询
         result = self.db.conn.execute("MATCH (p:Package) RETURN p.name, p.version")
         packages = {}
@@ -562,80 +848,85 @@ class DependencyAnalyzer:
             if pkg_name not in packages:
                 packages[pkg_name] = []
             packages[pkg_name].append(row[1])
-        
+
         # 检查每个包是否有版本冲突
         for pkg_name, versions in packages.items():
             if len(versions) > 1:
                 # 查询谁依赖这些版本
                 dependents = self.db.query_dependents(pkg_name)
-                
+
                 # 检查约束是否冲突
                 constraints = defaultdict(list)
                 for dep in dependents:
                     constraints[dep["constraint"]].append(dep["source"])
-                
+
                 # 如果有多个不同的约束，可能冲突
                 if len(constraints) > 1:
                     conflict = ConflictInfo(
                         package=pkg_name,
-                        required_by=[{"package": pkg, "constraint": c} 
-                                    for c, pkgs in constraints.items() 
-                                    for pkg in pkgs],
+                        required_by=[
+                            {"package": pkg, "constraint": c}
+                            for c, pkgs in constraints.items()
+                            for pkg in pkgs
+                        ],
                         conflict_type="version_mismatch",
                         severity=SeverityLevel.HIGH,
-                        suggestion=f"统一 {pkg_name} 的版本约束"
+                        suggestion=f"统一 {pkg_name} 的版本约束",
                     )
                     conflicts.append(conflict)
-        
+
         logger.info(f"发现 {len(conflicts)} 个冲突")
         return conflicts
-    
+
     def recommend_optimal_versions(self) -> Dict[str, str]:
         """
         推荐最优版本
-        
+
         Returns:
             包名 -> 推荐版本的映射
         """
         logger.info("计算最优版本推荐...")
         recommendations = {}
-        
+
         # 查询所有包及其约束 - 使用参数化查询
         result = self.db.conn.execute("""
             MATCH (p:Package)-[d:DependsOn]->(dep:Package)
             RETURN p.name, dep.name, d.constraint
         """)
-        
+
         constraints = defaultdict(list)
         all_versions = defaultdict(set)
-        
+
         # 收集所有约束
         while result.has_next():
             row = result.get_next()
             target_pkg = row[1]
             constraint = row[2]
             constraints[target_pkg].append(constraint)
-            
+
             # 获取所有可用版本 - 使用参数化查询
-            ver_result = self.db.conn.execute("""
+            ver_result = self.db.conn.execute(
+                """
                 MATCH (p:Package) WHERE p.name = $name
                 RETURN p.version
-            """, {"name": target_pkg})
+            """,
+                {"name": target_pkg},
+            )
             while ver_result.has_next():
                 all_versions[target_pkg].add(ver_result.get_next()[0])
-        
+
         # 为每个包找到满足所有约束的最优版本
         for pkg_name, pkg_constraints in constraints.items():
             versions = list(all_versions.get(pkg_name, []))
             if not versions:
                 continue
-            
+
             # 找到满足所有约束的版本
             valid_versions = []
             for version in versions:
                 if all(check_version_constraint(version, c) for c in pkg_constraints):
                     valid_versions.append(version)
-            
+
             if valid_versions:
                 # 选择最新版本
                 sorted_versions = sort_versions(valid_versions, reverse=True)
@@ -645,43 +936,45 @@ class DependencyAnalyzer:
                 recommendations[pkg_name] = self._find_best_compromise(
                     versions, pkg_constraints
                 )
-        
+
         logger.info(f"生成 {len(recommendations)} 个版本推荐")
         return recommendations
-    
-    def _find_best_compromise(self, versions: List[str], 
-                             constraints: List[str]) -> str:
+
+    def _find_best_compromise(self, versions: List[str], constraints: List[str]) -> str:
         """找到最佳妥协版本"""
         best_version = versions[0]
         max_satisfied = 0
-        
+
         for version in versions:
-            satisfied = sum(1 for c in constraints 
-                          if check_version_constraint(version, c))
+            satisfied = sum(
+                1 for c in constraints if check_version_constraint(version, c)
+            )
             if satisfied > max_satisfied:
                 max_satisfied = satisfied
                 best_version = version
-        
+
         return best_version
-    
+
     def assess_security(self) -> List[SecurityVulnerability]:
         """
         评估依赖安全性
-        
+
         Returns:
             漏洞列表
         """
         logger.info("评估依赖安全性...")
-        
+
         result = self.db.conn.execute("""
             MATCH (v:Vulnerability)-[:Affects]->(p:Package)
-            RETURN v.cve_id, v.package, v.affected_version, 
-                   v.severity, v.description, v.fixed_version
+            RETURN v.cve_id, v.package, v.affected_version,
+                   v.severity, v.description, v.fixed_version,
+                   v.cvss_vector, v.cvss_score
         """)
-        
+
         vulnerabilities = []
         while result.has_next():
             row = result.get_next()
+            cvss_score = row[7]
             vuln = SecurityVulnerability(
                 cve_id=row[0],
                 package=row[1],
@@ -689,44 +982,48 @@ class DependencyAnalyzer:
                 severity=SeverityLevel(row[3]),
                 description=row[4],
                 fixed_version=row[5] if row[5] else None,
+                cvss_vector=row[6] if row[6] else None,
+                cvss_score=cvss_score
+                if isinstance(cvss_score, (int, float)) and cvss_score >= 0
+                else None,
             )
             vulnerabilities.append(vuln)
-        
+
         logger.info(f"发现 {len(vulnerabilities)} 个安全漏洞")
         return vulnerabilities
-    
+
     def plan_update_paths(self) -> List[UpdatePath]:
         """
         规划更新路径
-        
+
         Returns:
             更新路径列表
         """
         logger.info("规划更新路径...")
         update_paths = []
-        
+
         # 获取所有需要更新的包（有漏洞或版本过旧）
         result = self.db.conn.execute("""
             MATCH (v:Vulnerability)-[:Affects]->(p:Package)
             WHERE v.fixed_version IS NOT NULL
             RETURN p.name, p.version, v.fixed_version, v.cve_id
         """)
-        
+
         updates = {}
         while result.has_next():
             row = result.get_next()
             pkg_name = row[0]
             current_ver = row[1]
             fixed_ver = row[2]
-            
+
             if pkg_name not in updates:
                 updates[pkg_name] = {
                     "current": current_ver,
                     "target": fixed_ver,
-                    "reasons": []
+                    "reasons": [],
                 }
             updates[pkg_name]["reasons"].append(f"修复 {row[3]}")
-        
+
         # 生成更新路径
         for pkg_name, info in updates.items():
             path = UpdatePath(
@@ -737,37 +1034,37 @@ class DependencyAnalyzer:
                     f"当前版本: {info['current']}",
                     f"目标版本: {info['target']}",
                     f"原因: {', '.join(info['reasons'])}",
-                    "建议: 在测试环境验证后更新"
+                    "建议: 在测试环境验证后更新",
                 ],
                 breaking_changes=[],
-                recommendation=f"建议更新到 {info['target']} 以修复安全问题"
+                recommendation=f"建议更新到 {info['target']} 以修复安全问题",
             )
             update_paths.append(path)
-        
+
         logger.info(f"生成 {len(update_paths)} 条更新路径")
         return update_paths
-    
+
     def generate_report(self, root_package: str) -> AnalysisReport:
         """
         生成完整分析报告
-        
+
         Args:
             root_package: 根包名
-            
+
         Returns:
             分析报告
         """
         logger.info(f"生成依赖分析报告: {root_package}")
-        
+
         # 收集所有分析结果
         conflicts = self.detect_conflicts()
         recommendations = self.recommend_optimal_versions()
         vulnerabilities = self.assess_security()
         update_paths = self.plan_update_paths()
-        
+
         # 获取图统计
         stats = self.db.get_graph_stats()
-        
+
         # 生成建议
         recommendations_list = []
         if conflicts:
@@ -782,7 +1079,18 @@ class DependencyAnalyzer:
             recommendations_list.append(
                 f"有 {len(update_paths)} 个包可以更新到更安全的版本"
             )
-        
+
+        # 显式收集漏洞扫描状态告警（OSV 失败时不得静默谎报"无漏洞"）
+        scan_warnings: List[str] = []
+        status = self.osv_scan_status
+        if status and not status.get("scanned"):
+            pkg_list = status.get("packages", [])
+            scan_warnings.append(
+                f"安全漏洞扫描未完成：{status.get('reason', '未知原因')}。"
+                f"漏洞列表可能不完整（涉及 {len(pkg_list)} 个包），"
+                f"请检查网络后重试或人工核查。"
+            )
+
         report = AnalysisReport(
             timestamp=time.time(),
             root_package=root_package,
@@ -792,11 +1100,12 @@ class DependencyAnalyzer:
             vulnerabilities=vulnerabilities,
             update_paths=update_paths,
             recommendations=recommendations_list,
-            graph_stats=stats
+            graph_stats=stats,
+            scan_warnings=scan_warnings,
         )
-        
+
         return report
-    
+
     def report_to_dict(self, report: AnalysisReport) -> Dict[str, Any]:
         """将 AnalysisReport 转换为 dict（供 JSON/HTML/PDF 渲染用）"""
         return {
@@ -827,6 +1136,8 @@ class DependencyAnalyzer:
                     "severity": v.severity.value,
                     "description": v.description,
                     "fixed_version": v.fixed_version,
+                    "cvss_vector": v.cvss_vector,
+                    "cvss_score": v.cvss_score,
                 }
                 for v in report.vulnerabilities
             ],
@@ -841,19 +1152,19 @@ class DependencyAnalyzer:
                 for p in report.update_paths
             ],
             "recommendations": report.recommendations,
+            "scan_warnings": report.scan_warnings,
         }
 
-    def export_report_json(self, report: AnalysisReport,
-                          output_file: str):
+    def export_report_json(self, report: AnalysisReport, output_file: str):
         """导出报告为 JSON"""
         report_dict = self.report_to_dict(report)
 
         output_path = Path(output_file)
-        with output_path.open('w', encoding='utf-8') as f:
+        with output_path.open("w", encoding="utf-8") as f:
             json.dump(report_dict, f, indent=2, ensure_ascii=False)
 
         logger.info(f"报告已导出: {output_file}")
-    
+
     def close(self):
         """关闭数据库"""
         try:
@@ -921,19 +1232,23 @@ def detect_dependency_file(project_path: str) -> Optional[str]:
             if filepath.is_file():
                 suffix = filepath.suffix.lower()
                 if suffix in dependency_extensions:
-                    logger.info(f"检测到 {dependency_extensions[suffix]} 项目: {filepath.name}")
+                    logger.info(
+                        f"检测到 {dependency_extensions[suffix]} 项目: {filepath.name}"
+                    )
                     return str(filepath)
 
     return None
 
 
-def parse_pyproject_toml(project_path: str) -> tuple[List[DependencyNode], List[DependencyEdge]]:
+def parse_pyproject_toml(
+    project_path: str,
+) -> tuple[List[DependencyNode], List[DependencyEdge]]:
     """
     解析 pyproject.toml 文件，提取依赖信息
-    
+
     Args:
         project_path: pyproject.toml 文件路径
-    
+
     Returns:
         (packages, edges) 元组
     """
@@ -945,81 +1260,78 @@ def parse_pyproject_toml(project_path: str) -> tuple[List[DependencyNode], List[
         except ImportError:
             logger.error("需要安装 tomli 库: pip install tomli")
             sys.exit(1)
-    
+
     path_obj = Path(project_path)
     if not path_obj.exists():
         logger.error(f"找不到文件 {project_path}")
         sys.exit(1)
-    
+
     # 读取并解析 TOML 文件
     try:
-        with path_obj.open('rb') as f:
+        with path_obj.open("rb") as f:
             data = tomllib.load(f)
     except Exception as e:
         logger.error(f"解析 TOML 文件失败: {e}")
         sys.exit(1)
-    
+
     # 提取项目名称
     project_info = data.get("project", {})
     project_name = project_info.get("name", "unknown")
     project_version = project_info.get("version", "0.1.0")
-    
+
     # 提取依赖列表
     dependencies = project_info.get("dependencies", [])
     if not dependencies:
         logger.warning("未找到 dependencies 字段")
         return [], []
-    
+
     packages = [
         DependencyNode(
-            name=project_name,
-            version=project_version,
-            ecosystem="pypi",
-            is_root=True
+            name=project_name, version=project_version, ecosystem="pypi", is_root=True
         )
     ]
-    
+
     edges = []
-    
+
     for dep_str in dependencies:
         # 跳过注释
-        if dep_str.startswith('#'):
+        if dep_str.startswith("#"):
             continue
-        
+
         # 解析包名和版本约束
         # 格式: package>=1.0.0 或 package==1.0.0 或 package
         # 或者: package[extra]>=1.0.0
-        match = re.match(r'([a-zA-Z0-9_-]+)(?:\[.*?\])?\s*(.*)?', dep_str)
+        match = re.match(r"([a-zA-Z0-9_-]+)(?:\[.*?\])?\s*(.*)?", dep_str)
         if match:
             pkg_name = match.group(1).lower()
             constraint = match.group(2).strip() if match.group(2) else "*"
-            
+
             # 提取版本号（简化处理）
-            ver_match = re.search(r'>=?\s*([0-9][^,\s\]]*)', constraint)
+            ver_match = re.search(r">=?\s*([0-9][^,\s\]]*)", constraint)
             version = ver_match.group(1) if ver_match else "0.0.0"
-            
-            packages.append(DependencyNode(
-                name=pkg_name,
-                version=version,
-                ecosystem="pypi"
-            ))
-            
-            edges.append(DependencyEdge(
-                source=project_name,
-                target=pkg_name,
-                constraint=constraint
-            ))
-    
+
+            packages.append(
+                DependencyNode(name=pkg_name, version=version, ecosystem="pypi")
+            )
+
+            edges.append(
+                DependencyEdge(
+                    source=project_name, target=pkg_name, constraint=constraint
+                )
+            )
+
     return packages, edges
 
 
-def parse_package_json(project_path: str) -> tuple[List[DependencyNode], List[DependencyEdge]]:
+def parse_package_json(
+    project_path: str,
+) -> tuple[List[DependencyNode], List[DependencyEdge]]:
     """
     解析 package.json 文件，提取依赖信息
-    
+
     Args:
         project_path: package.json 文件路径
-    
+
     Returns:
         (packages, edges) 元组
     """
@@ -1027,61 +1339,56 @@ def parse_package_json(project_path: str) -> tuple[List[DependencyNode], List[De
     if not path_obj.exists():
         logger.error(f"找不到文件 {project_path}")
         sys.exit(1)
-    
+
     try:
-        with path_obj.open('r', encoding='utf-8') as f:
+        with path_obj.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
         sys.exit(1)
-    
+
     project_name = data.get("name", "unknown")
     project_version = data.get("version", "0.1.0")
-    
+
     packages = [
         DependencyNode(
-            name=project_name,
-            version=project_version,
-            ecosystem="npm",
-            is_root=True
+            name=project_name, version=project_version, ecosystem="npm", is_root=True
         )
     ]
-    
+
     edges = []
-    
+
     # 合并 dependencies 和 devDependencies
     all_deps = {}
     all_deps.update(data.get("dependencies", {}))
     all_deps.update(data.get("devDependencies", {}))
-    
+
     for pkg_name, version_constraint in all_deps.items():
         # 提取版本号
         version = version_constraint.lstrip("^~>=<")
         if not version or not version[0].isdigit():
             version = "0.0.0"
-        
-        packages.append(DependencyNode(
-            name=pkg_name,
-            version=version,
-            ecosystem="npm"
-        ))
-        
-        edges.append(DependencyEdge(
-            source=project_name,
-            target=pkg_name,
-            constraint=version_constraint
-        ))
-    
+
+        packages.append(DependencyNode(name=pkg_name, version=version, ecosystem="npm"))
+
+        edges.append(
+            DependencyEdge(
+                source=project_name, target=pkg_name, constraint=version_constraint
+            )
+        )
+
     return packages, edges
 
 
-def parse_requirements_txt(project_path: str) -> tuple[List[DependencyNode], List[DependencyEdge]]:
+def parse_requirements_txt(
+    project_path: str,
+) -> tuple[List[DependencyNode], List[DependencyEdge]]:
     """
     解析 requirements.txt 文件，提取依赖信息
-    
+
     Args:
         project_path: requirements.txt 文件路径
-    
+
     Returns:
         (packages, edges) 元组
     """
@@ -1089,57 +1396,57 @@ def parse_requirements_txt(project_path: str) -> tuple[List[DependencyNode], Lis
     if not path_obj.exists():
         logger.error(f"找不到文件 {project_path}")
         sys.exit(1)
-    
+
     try:
-        with path_obj.open('r', encoding='utf-8') as f:
+        with path_obj.open("r", encoding="utf-8") as f:
             lines = f.readlines()
     except Exception as e:
         logger.error(f"读取文件失败: {e}")
         sys.exit(1)
-    
+
     project_name = "unknown"
     packages = []
     edges = []
-    
+
     for line in lines:
         line = line.strip()
-        
+
         # 跳过注释和空行
-        if not line or line.startswith('#') or line.startswith('-'):
+        if not line or line.startswith("#") or line.startswith("-"):
             continue
-        
+
         # 解析包名和版本
-        match = re.match(r'([a-zA-Z0-9_-]+)\s*(.*)?', line)
+        match = re.match(r"([a-zA-Z0-9_-]+)\s*(.*)?", line)
         if match:
             pkg_name = match.group(1).lower()
             constraint = match.group(2).strip() if match.group(2) else "*"
-            
+
             # 提取版本号
-            ver_match = re.search(r'[=<>!]+\s*([0-9][^,\s;]*)', constraint)
+            ver_match = re.search(r"[=<>!]+\s*([0-9][^,\s;]*)", constraint)
             version = ver_match.group(1) if ver_match else "0.0.0"
-            
-            packages.append(DependencyNode(
-                name=pkg_name,
-                version=version,
-                ecosystem="pypi"
-            ))
-    
+
+            packages.append(
+                DependencyNode(name=pkg_name, version=version, ecosystem="pypi")
+            )
+
     return packages, edges
 
 
-def parse_dependencies(project_path: str) -> tuple[List[DependencyNode], List[DependencyEdge], str]:
+def parse_dependencies(
+    project_path: str,
+) -> tuple[List[DependencyNode], List[DependencyEdge], str]:
     """
     智能解析项目依赖，自动检测依赖文件类型
-    
+
     Args:
         project_path: 项目路径或依赖文件路径
-    
+
     Returns:
         (packages, edges, ecosystem) 元组
     """
     # 自动检测依赖文件
     dep_file = detect_dependency_file(project_path)
-    
+
     if not dep_file:
         logger.error(f"在项目 {project_path} 中未找到支持的依赖文件")
         logger.info("支持的依赖文件:")
@@ -1192,18 +1499,20 @@ def parse_dependencies(project_path: str) -> tuple[List[DependencyNode], List[De
             )
         else:
             logger.warning(f"暂不支持自动解析 {filename}")
-            logger.info("提示: 目前支持自动解析 pyproject.toml, package.json, requirements.txt")
+            logger.info(
+                "提示: 目前支持自动解析 pyproject.toml, package.json, requirements.txt"
+            )
         sys.exit(1)
-    
+
     parse_func, ecosystem = parsers[filename]
-    
+
     logger.info(f"解析依赖文件: {filename}")
     packages, edges = parse_func(dep_file)
-    
+
     if not packages:
         logger.error("未找到依赖信息")
         sys.exit(1)
-    
+
     return packages, edges, ecosystem
 
 
@@ -1261,104 +1570,110 @@ def cmd_analyze_data(args):
     """分析依赖数据文件"""
     data_file = args.data_file
     data_path = Path(data_file)
-    
+
     if not data_path.exists():
         logger.error(f"找不到文件 {data_file}")
         sys.exit(1)
-    
+
     # 读取 JSON 数据
     try:
-        with data_path.open('r', encoding='utf-8') as f:
+        with data_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
         sys.exit(1)
-    
+
     # 验证数据格式
     if "packages" not in data or "edges" not in data:
         logger.error("JSON 文件必须包含 'packages' 和 'edges' 字段")
         sys.exit(1)
-    
+
     logger.info(f"正在分析依赖数据: {data_file}")
-    
+
     # 解析数据
     packages = []
     for pkg_data in data["packages"]:
-        packages.append(DependencyNode(
-            name=pkg_data["name"],
-            version=pkg_data.get("version", "0.0.0"),
-            ecosystem=pkg_data.get("ecosystem", "pypi"),
-            is_root=pkg_data.get("is_root", False)
-        ))
-    
+        packages.append(
+            DependencyNode(
+                name=pkg_data["name"],
+                version=pkg_data.get("version", "0.0.0"),
+                ecosystem=pkg_data.get("ecosystem", "pypi"),
+                is_root=pkg_data.get("is_root", False),
+            )
+        )
+
     edges = []
     for edge_data in data["edges"]:
-        edges.append(DependencyEdge(
-            source=edge_data["source"],
-            target=edge_data["target"],
-            constraint=edge_data.get("constraint", "*")
-        ))
-    
+        edges.append(
+            DependencyEdge(
+                source=edge_data["source"],
+                target=edge_data["target"],
+                constraint=edge_data.get("constraint", "*"),
+            )
+        )
+
     logger.info(f"加载 {len(packages)} 个包, {len(edges)} 个依赖关系")
-    
+
     # 创建分析器
     analyzer = DependencyAnalyzer()
-    
+
     try:
         # 构建依赖图
         analyzer.build_dependency_graph(packages, edges)
-        
+
         # 执行分析
         if args.conflicts:
             conflicts = analyzer.detect_conflicts()
             display_conflicts(conflicts)
-        
+
         if args.recommend:
             recommendations = analyzer.recommend_optimal_versions()
             display_recommendations(recommendations)
-        
+
         if args.security:
             vulns = analyzer.assess_security()
             display_vulnerabilities(vulns)
-        
+
         if args.updates:
             update_paths = analyzer.plan_update_paths()
             display_update_paths(update_paths)
-        
+
         # 生成完整报告
         if args.report:
             root_pkg = packages[0].name if packages else "unknown"
             report = analyzer.generate_report(root_pkg)
-            
+
             output_file = args.output if args.output else "dependency_report.json"
             analyzer.export_report_json(report, output_file)
             logger.info(f"报告已保存到: {output_file}")
-        
+
         # 显示摘要
-        if not any([args.conflicts, args.recommend, args.security, args.updates, args.report]):
+        if not any(
+            [args.conflicts, args.recommend, args.security, args.updates, args.report]
+        ):
             # 默认显示所有分析
             conflicts = analyzer.detect_conflicts()
             recommendations = analyzer.recommend_optimal_versions()
             vulns = analyzer.assess_security()
             update_paths = analyzer.plan_update_paths()
-            
+
             logger.info("分析摘要")
             logger.info(f"总包数: {len(packages)}")
             logger.info(f"总依赖关系: {len(edges)}")
             logger.info(f"冲突数: {len(conflicts)}")
             logger.info(f"安全漏洞: {len(vulns)}")
             logger.info(f"更新建议: {len(update_paths)}")
-            
+
             if conflicts:
                 logger.warning(f"发现 {len(conflicts)} 个依赖冲突")
             if vulns:
                 logger.warning(f"发现 {len(vulns)} 个安全漏洞")
             if update_paths:
                 logger.info(f"有 {len(update_paths)} 个包可以更新")
-            
+
             if not conflicts and not vulns and not update_paths:
                 logger.info("依赖状态良好")
-    
+
     finally:
         try:
             analyzer.close()
@@ -1366,8 +1681,7 @@ def cmd_analyze_data(args):
             logger.error(f"关闭分析器时出错: {e}")
 
 
-def _to_deps_data(packages: List[DependencyNode],
-                  edges: List[DependencyEdge]) -> dict:
+def _to_deps_data(packages: List[DependencyNode], edges: List[DependencyEdge]) -> dict:
     """
     将 DependencyNode/Edge 列表转为 deps_data dict schema
 
@@ -1400,37 +1714,39 @@ def cmd_analyze(args):
     project_path = args.project
 
     logger.info(f"正在分析项目: {project_path}")
-    
+
     # 智能解析项目依赖
     packages, edges, ecosystem = parse_dependencies(project_path)
-    
+
     logger.info(f"找到 {len(packages)} 个包, {len(edges)} 个依赖关系")
-    
+
     # 创建分析器
     analyzer = DependencyAnalyzer()
-    
+
     try:
         # 构建依赖图
         analyzer.build_dependency_graph(packages, edges)
 
         # 可视化依赖树（Mermaid flowchart）
-        if getattr(args, 'visualize', False):
+        if getattr(args, "visualize", False):
             import visualizer
+
             deps_data = _to_deps_data(packages, edges)
-            depth = getattr(args, 'depth', 3) or 3
+            depth = getattr(args, "depth", 3) or 3
             mermaid = visualizer.render_mermaid_tree(deps_data, depth=depth)
-            output_file = getattr(args, 'output', None)
+            output_file = getattr(args, "output", None)
             if output_file:
                 out_path = Path(output_file)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(mermaid, encoding='utf-8')
+                out_path.write_text(mermaid, encoding="utf-8")
                 logger.info(f"依赖树已写入: {output_file}")
             else:
                 print(mermaid)
 
         # 冲突影响范围分析
-        if getattr(args, 'impact', False):
+        if getattr(args, "impact", False):
             import impact_analyzer
+
             deps_data = _to_deps_data(packages, edges)
             conflicts = analyzer.detect_conflicts()
             conflicts_data = [
@@ -1444,13 +1760,13 @@ def cmd_analyze(args):
                 for c in conflicts
             ]
             impacts = impact_analyzer.analyze_conflict_impact(deps_data, conflicts_data)
-            output_file = getattr(args, 'output', None)
+            output_file = getattr(args, "output", None)
             if output_file:
                 out_path = Path(output_file)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(
                     json.dumps(impacts, indent=2, ensure_ascii=False),
-                    encoding='utf-8',
+                    encoding="utf-8",
                 )
                 logger.info(f"影响分析已写入: {output_file}")
             else:
@@ -1482,31 +1798,40 @@ def cmd_analyze(args):
             logger.info(f"报告已保存到: {output_file}")
 
         # 显示摘要
-        if not any([args.conflicts, args.recommend, args.security, args.updates, args.report,
-                    getattr(args, 'visualize', False), getattr(args, 'impact', False)]):
+        if not any(
+            [
+                args.conflicts,
+                args.recommend,
+                args.security,
+                args.updates,
+                args.report,
+                getattr(args, "visualize", False),
+                getattr(args, "impact", False),
+            ]
+        ):
             # 默认显示所有分析
             conflicts = analyzer.detect_conflicts()
             recommendations = analyzer.recommend_optimal_versions()
             vulns = analyzer.assess_security()
             update_paths = analyzer.plan_update_paths()
-            
+
             logger.info("分析摘要")
             logger.info(f"总包数: {len(packages)}")
             logger.info(f"总依赖关系: {len(edges)}")
             logger.info(f"冲突数: {len(conflicts)}")
             logger.info(f"安全漏洞: {len(vulns)}")
             logger.info(f"更新建议: {len(update_paths)}")
-            
+
             if conflicts:
                 logger.warning(f"发现 {len(conflicts)} 个依赖冲突")
             if vulns:
                 logger.warning(f"发现 {len(vulns)} 个安全漏洞")
             if update_paths:
                 logger.info(f"有 {len(update_paths)} 个包可以更新")
-            
+
             if not conflicts and not vulns and not update_paths:
                 logger.info("依赖状态良好")
-    
+
     finally:
         try:
             analyzer.close()
@@ -1536,17 +1861,16 @@ def cmd_query(args):
     if not script_name:
         logger.error(f"不支持的生态系统 {ecosystem}")
         sys.exit(1)
-    
+
     # 执行查询
     script_path = Path(__file__).parent / script_name
-    
+
     import subprocess
+
     result = subprocess.run(
-        [sys.executable, str(script_path), package_name],
-        capture_output=True,
-        text=True
+        [sys.executable, str(script_path), package_name], capture_output=True, text=True
     )
-    
+
     if result.returncode == 0:
         print(result.stdout)
     else:
@@ -1575,16 +1899,17 @@ def cmd_search(args):
     if not script_name:
         logger.error(f"不支持的生态系统 {ecosystem}")
         sys.exit(1)
-    
+
     script_path = Path(__file__).parent / script_name
-    
+
     import subprocess
+
     result = subprocess.run(
         [sys.executable, str(script_path), "--search", keyword],
         capture_output=True,
-        text=True
+        text=True,
     )
-    
+
     if result.returncode == 0:
         print(result.stdout)
     else:
@@ -1604,10 +1929,13 @@ def cmd_security(args):
     try:
         import json as _json
         import subprocess as _sp
+
         script_path = Path(__file__).parent / "pypi.py"
         result = _sp.run(
             [sys.executable, str(script_path), package_name],
-            capture_output=True, text=True, timeout=60
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         if result.returncode == 0:
             pkg_info = _json.loads(result.stdout)
@@ -1629,9 +1957,7 @@ def cmd_security(args):
     try:
         # 用真实版本创建 DependencyNode
         pkg = DependencyNode(
-            name=package_name,
-            version=latest_version,
-            ecosystem="pypi"
+            name=package_name, version=latest_version, ecosystem="pypi"
         )
 
         packages = [pkg]
@@ -1639,13 +1965,22 @@ def cmd_security(args):
 
         analyzer.build_dependency_graph(packages, edges)
 
+        # OSV 扫描失败时显式告知（不静默谎报"无漏洞"）
+        if not analyzer.osv_scan_status.get("scanned"):
+            print(
+                f"\n⚠️ 安全漏洞扫描未完成：{analyzer.osv_scan_status.get('reason', '未知')}"
+            )
+            print("   漏洞列表可能不完整，请检查网络后重试或人工核查。")
+            return
+
         # 检查漏洞
         vulns = analyzer.assess_security()
 
         if vulns:
             # --priority: 按 CVSS + exploit + business 加权排序
-            if getattr(args, 'priority', False):
+            if getattr(args, "priority", False):
                 import vulnerability_prioritizer
+
                 vuln_dicts = [
                     {
                         "cve_id": v.cve_id,
@@ -1654,14 +1989,20 @@ def cmd_security(args):
                         "severity": v.severity.value,
                         "description": v.description,
                         "fixed_version": v.fixed_version,
+                        "cvss_vector": v.cvss_vector,
+                        "cvss_score": v.cvss_score,
                     }
                     for v in vulns
                 ]
                 # 单包 security 查询：被检查的包本身视为根依赖
                 deps_data = {
                     "packages": [
-                        {"name": package_name, "version": latest_version,
-                         "is_root": True, "ecosystem": "pypi"}
+                        {
+                            "name": package_name,
+                            "version": latest_version,
+                            "is_root": True,
+                            "ecosystem": "pypi",
+                        }
                     ],
                     "edges": [],
                 }
@@ -1682,7 +2023,7 @@ def cmd_security(args):
                         print(f"  修复版本: {vuln.fixed_version}")
         else:
             print("\n✅ 未发现已知安全漏洞")
-    
+
     finally:
         analyzer.close()
 
@@ -1690,7 +2031,7 @@ def cmd_security(args):
 def cmd_report(args):
     """生成完整报告（支持 json/html/pdf/sbom 格式）"""
     data_file = args.data_file
-    fmt = getattr(args, 'format', 'json') or 'json'
+    fmt = getattr(args, "format", "json") or "json"
     output_file = args.output  # 默认 None，按格式决定
 
     print(f"正在生成依赖报告: {data_file} (format={fmt})")
@@ -1702,7 +2043,7 @@ def cmd_report(args):
         sys.exit(1)
 
     try:
-        with data_path.open('r', encoding='utf-8') as f:
+        with data_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
@@ -1715,6 +2056,7 @@ def cmd_report(args):
     # SBOM 格式：直接用 packages + edges 生成 SPDX（无需分析报告）
     if fmt == "sbom":
         import sbom_generator
+
         project_name = data["packages"][0]["name"] if data["packages"] else "unknown"
         if output_file is None:
             output_file = f"{project_name}-sbom.spdx.json"
@@ -1734,27 +2076,29 @@ def cmd_report(args):
     # JSON/HTML/PDF：先生成分析报告
     packages = []
     for pkg_data in data["packages"]:
-        packages.append(DependencyNode(
-            name=pkg_data["name"],
-            version=pkg_data.get("version", "0.0.0"),
-            ecosystem=pkg_data.get("ecosystem", "pypi"),
-            is_root=pkg_data.get("is_root", False)
-        ))
+        packages.append(
+            DependencyNode(
+                name=pkg_data["name"],
+                version=pkg_data.get("version", "0.0.0"),
+                ecosystem=pkg_data.get("ecosystem", "pypi"),
+                is_root=pkg_data.get("is_root", False),
+            )
+        )
 
     edges = []
     for edge_data in data["edges"]:
-        edges.append(DependencyEdge(
-            source=edge_data["source"],
-            target=edge_data["target"],
-            constraint=edge_data.get("constraint", "*")
-        ))
+        edges.append(
+            DependencyEdge(
+                source=edge_data["source"],
+                target=edge_data["target"],
+                constraint=edge_data.get("constraint", "*"),
+            )
+        )
 
     analyzer = DependencyAnalyzer()
     try:
         analyzer.build_dependency_graph(packages, edges)
-        report = analyzer.generate_report(
-            packages[0].name if packages else "unknown"
-        )
+        report = analyzer.generate_report(packages[0].name if packages else "unknown")
         report_dict = analyzer.report_to_dict(report)
     finally:
         analyzer.close()
@@ -1765,6 +2109,7 @@ def cmd_report(args):
 
     # 按格式分派到 report_renderer
     import report_renderer
+
     try:
         result_path = report_renderer.render_report(report_dict, output_file, fmt=fmt)
         print(f"报告已生成: {result_path} (format={fmt})")
@@ -1791,15 +2136,14 @@ def cmd_health(args):
     analyzer = DependencyAnalyzer()
     try:
         analyzer.build_dependency_graph(packages, edges)
-        report = analyzer.generate_report(
-            packages[0].name if packages else "unknown"
-        )
+        report = analyzer.generate_report(packages[0].name if packages else "unknown")
         report_dict = analyzer.report_to_dict(report)
     finally:
         analyzer.close()
 
     # 计算健康度评分
     import health_scorer
+
     result = health_scorer.score_health(report_dict)
 
     # 输出结果
@@ -1833,10 +2177,10 @@ def cmd_health(args):
     print(radar)
 
     # 可选：写出 JSON 结果
-    if getattr(args, 'output', None):
+    if getattr(args, "output", None):
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open('w', encoding='utf-8') as f:
+        with output_path.open("w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"\n评分结果已写入: {args.output}")
 
@@ -1856,15 +2200,16 @@ def cmd_readme(args):
 
     # 用 EcosystemFetcher 查 registry 获取 description/license
     import readme_generator
+
     fetcher = readme_generator.EcosystemFetcher()
     markdown = readme_generator.generate_dependency_readme(deps_data, fetcher=fetcher)
 
     # 输出
-    output_file = getattr(args, 'output', None)
+    output_file = getattr(args, "output", None)
     if output_file:
         out_path = Path(output_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(markdown, encoding='utf-8')
+        out_path.write_text(markdown, encoding="utf-8")
         print(f"依赖 README 已写入: {output_file}")
     else:
         print(markdown)
@@ -1874,7 +2219,7 @@ def cmd_simulate(args):
     """升级影响模拟（dry-run）"""
     package = args.package
     target_version = args.target_version
-    project_path = getattr(args, 'project', None)
+    project_path = getattr(args, "project", None)
 
     print(f"正在模拟升级 {package} -> {target_version}")
     print("=" * 70)
@@ -1889,15 +2234,16 @@ def cmd_simulate(args):
         ecosystem = "pypi"
 
     import simulator
+
     result = simulator.simulate_upgrade(
         deps_data, package, target_version, ecosystem=ecosystem
     )
 
-    output_file = getattr(args, 'output', None)
+    output_file = getattr(args, "output", None)
     if output_file:
         out_path = Path(output_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open('w', encoding='utf-8') as f:
+        with out_path.open("w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"模拟结果已写入: {output_file}")
     else:
@@ -1907,8 +2253,8 @@ def cmd_simulate(args):
 def cmd_monitor(args):
     """漏洞持续监控"""
     project_path = args.project
-    cron_schedule = getattr(args, 'cron', None)
-    webhook_url = getattr(args, 'webhook', None)
+    cron_schedule = getattr(args, "cron", None)
+    webhook_url = getattr(args, "webhook", None)
 
     import monitor
 
@@ -1924,7 +2270,7 @@ def cmd_monitor(args):
 
     # 执行扫描
     scan_result = monitor.run_scan(project_path)
-    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(scan_result['timestamp']))
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(scan_result["timestamp"]))
     print(f"扫描时间: {ts}")
     print(f"漏洞总数: {scan_result['total']}")
 
@@ -1951,6 +2297,74 @@ def cmd_monitor(args):
     print(f"\n扫描结果已保存到历史: {history_file}")
 
 
+def cmd_optimize(args):
+    """优化依赖配置（去重 + 删冗余 + 识别未使用）"""
+    project_path = args.project
+    print(f"正在优化依赖配置: {project_path}")
+    print("=" * 70)
+
+    packages, edges, ecosystem = parse_dependencies(project_path)
+    print(f"找到 {len(packages)} 个包, {len(edges)} 个依赖关系 (ecosystem={ecosystem})")
+    deps_data = _to_deps_data(packages, edges)
+
+    checks = getattr(args, "check", None)  # None=全部
+    # redundant deep 模式（需 fetcher 查 registry）
+    fetcher = None
+    redundant_enabled = checks is None or "redundant" in checks
+    if getattr(args, "deep", False) and redundant_enabled:
+        import readme_generator
+
+        fetcher = readme_generator.EcosystemFetcher()
+
+    import dependency_optimizer
+
+    result = dependency_optimizer.optimize(
+        project_path, deps_data, ecosystem, checks=checks, fetcher=fetcher
+    )
+
+    # quick 模式 fallback 显式告知（不静默成功）
+    if (
+        "redundant" in result.get("checks_run", [])
+        and result.get("redundant_mode") == "quick"
+    ):
+        print("📝 redundant 为 quick 模式（未用 --deep），结果基于 edges，准确性有限")
+
+    report = dependency_optimizer.format_optimize_report(result)
+    output_file = getattr(args, "output", None)
+    if output_file:
+        import json
+
+        out_path = Path(output_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"\n优化结果 JSON 已写入: {output_file}")
+        print("\n" + report)
+    else:
+        print(report)
+
+    # --apply：实际改配置文件（带 backup）。失败显式告知，不静默谎称已应用。
+    if getattr(args, "apply", False):
+        apply_result = dependency_optimizer.apply_optimization(
+            project_path, ecosystem, result, backup=True
+        )
+        print("\n" + "=" * 70)
+        if apply_result.get("applied"):
+            removed = apply_result.get("removed", [])
+            print(
+                f"✅ --apply 已应用：从 {apply_result['file']} 移除 {len(removed)} 个 unused 依赖"
+            )
+            for name in removed:
+                print(f"   - {name}")
+            if apply_result.get("backup_path"):
+                print(f"📦 备份已写入: {apply_result['backup_path']}")
+            if not removed:
+                print(f"ℹ️ {apply_result.get('reason', '')}")
+        else:
+            print(f"⚠️ --apply 未应用：{apply_result.get('reason', '未知原因')}")
+
+
 def main():
     """主函数 - 命令行入口"""
     parser = argparse.ArgumentParser(
@@ -1975,98 +2389,180 @@ def main():
   
   # 检查安全漏洞
   python dependency_analyzer.py security requests
-        """
+        """,
     )
-    
+
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
-    
+
     # analyze-data 命令
     analyze_parser = subparsers.add_parser("analyze-data", help="分析依赖数据文件")
     analyze_parser.add_argument("data_file", help="JSON 格式的依赖数据文件")
     analyze_parser.add_argument("--conflicts", action="store_true", help="只检测冲突")
-    analyze_parser.add_argument("--recommend", action="store_true", help="只获取版本推荐")
-    analyze_parser.add_argument("--security", action="store_true", help="只检查安全漏洞")
+    analyze_parser.add_argument(
+        "--recommend", action="store_true", help="只获取版本推荐"
+    )
+    analyze_parser.add_argument(
+        "--security", action="store_true", help="只检查安全漏洞"
+    )
     analyze_parser.add_argument("--updates", action="store_true", help="只显示更新路径")
     analyze_parser.add_argument("--report", action="store_true", help="生成完整报告")
     analyze_parser.add_argument("-o", "--output", help="报告输出文件路径")
-    
+
     # analyze 命令（保留用于向后兼容）
     analyze_parser2 = subparsers.add_parser("analyze", help="分析项目依赖（旧版）")
     analyze_parser2.add_argument("project", help="项目路径或 pyproject.toml 路径")
     analyze_parser2.add_argument("--conflicts", action="store_true", help="只检测冲突")
-    analyze_parser2.add_argument("--recommend", action="store_true", help="只获取版本推荐")
-    analyze_parser2.add_argument("--security", action="store_true", help="只检查安全漏洞")
-    analyze_parser2.add_argument("--updates", action="store_true", help="只显示更新路径")
+    analyze_parser2.add_argument(
+        "--recommend", action="store_true", help="只获取版本推荐"
+    )
+    analyze_parser2.add_argument(
+        "--security", action="store_true", help="只检查安全漏洞"
+    )
+    analyze_parser2.add_argument(
+        "--updates", action="store_true", help="只显示更新路径"
+    )
     analyze_parser2.add_argument("--report", action="store_true", help="生成完整报告")
-    analyze_parser2.add_argument("--visualize", action="store_true",
-                                  help="渲染 Mermaid 依赖树（flowchart TD）")
-    analyze_parser2.add_argument("--depth", type=int, default=3,
-                                  help="依赖树渲染深度（默认 3，从根出发的依赖层数）")
-    analyze_parser2.add_argument("--impact", action="store_true",
-                                  help="分析冲突影响范围（反向追溯受影响包 + 依赖链）")
+    analyze_parser2.add_argument(
+        "--visualize", action="store_true", help="渲染 Mermaid 依赖树（flowchart TD）"
+    )
+    analyze_parser2.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        help="依赖树渲染深度（默认 3，从根出发的依赖层数）",
+    )
+    analyze_parser2.add_argument(
+        "--impact",
+        action="store_true",
+        help="分析冲突影响范围（反向追溯受影响包 + 依赖链）",
+    )
     analyze_parser2.add_argument("-o", "--output", help="报告输出文件路径")
-    
+
     # query 命令
     query_parser = subparsers.add_parser("query", help="查询包信息")
     query_parser.add_argument("package", help="包名")
-    query_parser.add_argument("-e", "--ecosystem", choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
-                             default="pypi", help="包生态系统 (默认: pypi)")
+    query_parser.add_argument(
+        "-e",
+        "--ecosystem",
+        choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
+        default="pypi",
+        help="包生态系统 (默认: pypi)",
+    )
 
     # search 命令
     search_parser = subparsers.add_parser("search", help="搜索包")
     search_parser.add_argument("keyword", help="搜索关键词")
-    search_parser.add_argument("-e", "--ecosystem", choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
-                              default="pypi", help="包生态系统 (默认: pypi)")
-    
+    search_parser.add_argument(
+        "-e",
+        "--ecosystem",
+        choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
+        default="pypi",
+        help="包生态系统 (默认: pypi)",
+    )
+
     # security 命令
     security_parser = subparsers.add_parser("security", help="检查安全漏洞")
     security_parser.add_argument("package", help="包名")
-    security_parser.add_argument("--priority", action="store_true",
-                                  help="按修复优先级排序（CVSS × 0.5 + exploit × 0.3 + business × 0.2）")
-    
+    security_parser.add_argument(
+        "--priority",
+        action="store_true",
+        help="按修复优先级排序（CVSS × 0.5 + exploit × 0.3 + business × 0.2）",
+    )
+
     # report 命令
-    report_parser = subparsers.add_parser("report", help="生成完整报告（支持 json/html/pdf/sbom 格式）")
+    report_parser = subparsers.add_parser(
+        "report", help="生成完整报告（支持 json/html/pdf/sbom 格式）"
+    )
     report_parser.add_argument("data_file", help="JSON 格式的依赖数据文件")
-    report_parser.add_argument("-o", "--output", default=None,
-                              help="报告输出文件路径 (默认按格式决定: dependency_report.json / {project}-sbom.spdx.json)")
-    report_parser.add_argument("--format", choices=["json", "html", "pdf", "sbom"],
-                              default="json", help="报告格式 (默认: json)")
+    report_parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="报告输出文件路径 (默认按格式决定: dependency_report.json / {project}-sbom.spdx.json)",
+    )
+    report_parser.add_argument(
+        "--format",
+        choices=["json", "html", "pdf", "sbom"],
+        default="json",
+        help="报告格式 (默认: json)",
+    )
 
     # health 命令
-    health_parser = subparsers.add_parser("health", help="依赖健康度评分（5 维度 + 雷达图）")
+    health_parser = subparsers.add_parser(
+        "health", help="依赖健康度评分（5 维度 + 雷达图）"
+    )
     health_parser.add_argument("project", help="项目路径或依赖文件路径")
-    health_parser.add_argument("-o", "--output", default=None,
-                              help="可选: 评分结果 JSON 输出路径")
+    health_parser.add_argument(
+        "-o", "--output", default=None, help="可选: 评分结果 JSON 输出路径"
+    )
 
     # readme 命令
-    readme_parser = subparsers.add_parser("readme", help="生成项目依赖 README 章节（markdown）")
+    readme_parser = subparsers.add_parser(
+        "readme", help="生成项目依赖 README 章节（markdown）"
+    )
     readme_parser.add_argument("project", help="项目路径或依赖文件路径")
-    readme_parser.add_argument("-o", "--output", default=None,
-                               help="可选: markdown 输出路径（默认输出到 stdout）")
+    readme_parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="可选: markdown 输出路径（默认输出到 stdout）",
+    )
 
     # simulate 命令
     simulate_parser = subparsers.add_parser("simulate", help="升级影响模拟（dry-run）")
     simulate_parser.add_argument("package", help="待升级的包名")
     simulate_parser.add_argument("target_version", help="目标版本号")
-    simulate_parser.add_argument("--project", default=None,
-                                  help="项目路径（用于分析现有依赖图，可选）")
-    simulate_parser.add_argument("-o", "--output", default=None,
-                                  help="可选: JSON 输出路径（默认输出到 stdout）")
+    simulate_parser.add_argument(
+        "--project", default=None, help="项目路径（用于分析现有依赖图，可选）"
+    )
+    simulate_parser.add_argument(
+        "-o", "--output", default=None, help="可选: JSON 输出路径（默认输出到 stdout）"
+    )
 
     # monitor 命令
     monitor_parser = subparsers.add_parser("monitor", help="漏洞持续监控")
     monitor_parser.add_argument("project", help="项目路径")
-    monitor_parser.add_argument("--cron", default=None,
-                                  help="生成 crontab 条目（如 '0 9 * * *'），不实际安装")
-    monitor_parser.add_argument("--webhook", default=None,
-                                  help="webhook URL，检测到新漏洞时 POST 告警")
+    monitor_parser.add_argument(
+        "--cron", default=None, help="生成 crontab 条目（如 '0 9 * * *'），不实际安装"
+    )
+    monitor_parser.add_argument(
+        "--webhook", default=None, help="webhook URL，检测到新漏洞时 POST 告警"
+    )
+
+    # optimize 命令
+    optimize_parser = subparsers.add_parser(
+        "optimize", help="优化依赖配置（去重+删冗余+识别未使用）"
+    )
+    optimize_parser.add_argument("project", help="项目路径或依赖文件路径")
+    optimize_parser.add_argument(
+        "--check",
+        action="append",
+        choices=["dedupe", "redundant", "unused"],
+        help="指定检测项（可多次：--check dedupe --check unused，默认全部）",
+    )
+    optimize_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="redundant deep 模式（查 registry 准确判断，需网络）",
+    )
+    optimize_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="实际改配置文件移除 unused 依赖（自动备份 .dayv.bak；默认仅报告不改文件）",
+    )
+    optimize_parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="可选: JSON 结果输出路径（默认输出到 stdout）",
+    )
 
     args = parser.parse_args()
-    
+
     if not args.command:
         parser.print_help()
         sys.exit(1)
-    
+
     # 执行对应命令
     commands = {
         "analyze-data": cmd_analyze_data,
@@ -2079,8 +2575,9 @@ def main():
         "readme": cmd_readme,
         "simulate": cmd_simulate,
         "monitor": cmd_monitor,
+        "optimize": cmd_optimize,
     }
-    
+
     commands[args.command](args)
 
 

@@ -5,19 +5,27 @@ Maven 依赖查询脚本
 输入格式: groupId:artifactId (如: org.springframework.boot:spring-boot)
 """
 
-import json
 import re
-import sys
-from typing import Optional
+from functools import lru_cache
 from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
-from utils import fetch_html
+from base_ecosystem import BaseEcosystemAdapter
+from utils import fetch_html, register_cache
 
 
 # Maven 基础 URL
 MAVEN_BASE_URL = "https://mvnrepository.com"
+
+
+# ============ 缓存（@lru_cache；resolve 模块级 fetch_html 以兼容 patch.object 测试）============
+@lru_cache(maxsize=512)
+def _fetch_cached(url: str) -> str:
+    return fetch_html(url)
+
+
+register_cache(_fetch_cached.cache_clear)
 
 
 def parse_package_info(html_content: str, group_id: str, artifact_id: str) -> dict:
@@ -53,7 +61,7 @@ def parse_package_info(html_content: str, group_id: str, artifact_id: str) -> di
                     version = version_elem.get_text(strip=True)
                     date = date_elem.get_text(strip=True)
                     # 格式化日期
-                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', date)
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", date)
                     date = date_match.group(1) if date_match else ""
                     versions.append({"version": version, "date": date})
 
@@ -65,7 +73,9 @@ def parse_package_info(html_content: str, group_id: str, artifact_id: str) -> di
     for elem in soup.select("a"):
         text = elem.get_text(strip=True)
         href = elem.get("href", "")
-        if ("license" in text.lower() or "License" in text or "Apache" in text) and href.startswith("http"):
+        if (
+            "license" in text.lower() or "License" in text or "Apache" in text
+        ) and href.startswith("http"):
             license = text
             break
 
@@ -91,7 +101,9 @@ def parse_package_info(html_content: str, group_id: str, artifact_id: str) -> di
     for link in soup.select("a"):
         href = link.get("href", "")
         text = link.get_text(strip=True)
-        if ("Home Page" in text or "Github" in text or "GitHub" in text) and href.startswith("http"):
+        if (
+            "Home Page" in text or "Github" in text or "GitHub" in text
+        ) and href.startswith("http"):
             homepage = href
             break
 
@@ -143,13 +155,15 @@ def parse_search_results(html_content: str) -> dict:
                 description = desc_elem.get_text(strip=True)
 
         # 提取 groupId:artifactId
-        match = re.search(r'/artifact/([^/]+)/([^/]+)', href)
+        match = re.search(r"/artifact/([^/]+)/([^/]+)", href)
         if match:
-            results.append({
-                "name": f"{match.group(1)}:{match.group(2)}",
-                "description": description,
-                "latest_version": version,
-            })
+            results.append(
+                {
+                    "name": f"{match.group(1)}:{match.group(2)}",
+                    "description": description,
+                    "latest_version": version,
+                }
+            )
 
     # 备选：尝试旧的 .im-result-grid 选择器
     if not results:
@@ -165,13 +179,15 @@ def parse_search_results(html_content: str) -> dict:
                 description = desc_elem.get_text(strip=True) if desc_elem else ""
                 version = version_elem.get_text(strip=True) if version_elem else ""
 
-                match = re.search(r'/artifact/([^/]+)/([^/]+)', href)
+                match = re.search(r"/artifact/([^/]+)/([^/]+)", href)
                 if match:
-                    results.append({
-                        "name": f"{match.group(1)}:{match.group(2)}",
-                        "description": description,
-                        "latest_version": version,
-                    })
+                    results.append(
+                        {
+                            "name": f"{match.group(1)}:{match.group(2)}",
+                            "description": description,
+                            "latest_version": version,
+                        }
+                    )
 
     return {
         "total": len(results),
@@ -179,63 +195,56 @@ def parse_search_results(html_content: str) -> dict:
     }
 
 
+class MavenAdapter(BaseEcosystemAdapter):
+    """Maven 特异逻辑：mvnrepository.com HTML 抓取 + groupId:artifactId 双段名。"""
+
+    ECOSYSTEM_NAME = "maven"
+    PACKAGE_USAGE_HINT = "<groupId>:<artifactId>"
+    PACKAGE_FORMAT_HINT = "<groupId>:<artifactId>"
+    PACKAGE_FORMAT_ERROR = "请使用 groupId:artifactId 格式"
+
+    def validate_package_arg(self, arg: str) -> bool:
+        return ":" in arg
+
+    def split_package_arg(self, arg: str) -> tuple:
+        group_id, artifact_id = arg.split(":", 1)
+        return (group_id, artifact_id)
+
+    def build_package_url(self, group_id: str, artifact_id: str) -> str:
+        return (
+            f"{MAVEN_BASE_URL}/artifact/{quote(group_id, safe='')}"
+            f"/{quote(artifact_id, safe='')}"
+        )
+
+    def build_search_url(self, keyword: str) -> str:
+        return f"{MAVEN_BASE_URL}/search?q={quote(keyword, safe='')}"
+
+    def parse_package_info(
+        self, html_content: str, group_id: str, artifact_id: str
+    ) -> dict:
+        return parse_package_info(html_content, group_id, artifact_id)
+
+    def parse_search_results(self, html_content: str) -> dict:
+        return parse_search_results(html_content)
+
+
+_adapter = MavenAdapter(fetcher=_fetch_cached)
+
+
+# ============ 向后兼容模块级 API ============
 def get_package(group_id: str, artifact_id: str) -> dict:
-    """
-    获取 Maven 依赖详情
-
-    Args:
-        group_id: Group ID
-        artifact_id: Artifact ID
-
-    Returns:
-        依赖信息字典
-    """
-    url = f"{MAVEN_BASE_URL}/artifact/{quote(group_id, safe='')}/{quote(artifact_id, safe='')}"
-    html = fetch_html(url)
-    return parse_package_info(html, group_id, artifact_id)
+    """获取 Maven 依赖详情（委托 adapter，第二次同 URL 走缓存）。"""
+    return _adapter.get_package(group_id, artifact_id)
 
 
 def search_packages(keyword: str) -> dict:
-    """
-    搜索 Maven 依赖
-
-    Args:
-        keyword: 搜索关键词
-
-    Returns:
-        搜索结果字典
-    """
-    url = f"{MAVEN_BASE_URL}/search?q={quote(keyword, safe='')}"
-    html = fetch_html(url)
-    return parse_search_results(html)
+    """搜索 Maven 依赖（委托 adapter）。"""
+    return _adapter.search_packages(keyword)
 
 
 def main():
-    """命令行入口"""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python maven.py <groupId>:<artifactId>  # 查询依赖详情")
-        print("  python maven.py --search <keyword>       # 搜索依赖")
-        sys.exit(1)
-
-    if sys.argv[1] == "--search":
-        if len(sys.argv) < 3:
-            print("Error: 请提供搜索关键词")
-            sys.exit(1)
-        keyword = sys.argv[2]
-        result = search_packages(keyword)
-    else:
-        # 解析 groupId:artifactId
-        coord = sys.argv[1]
-        if ":" not in coord:
-            print("Error: 请使用 groupId:artifactId 格式")
-            sys.exit(1)
-        parts = coord.split(":", 1)
-        group_id = parts[0]
-        artifact_id = parts[1]
-        result = get_package(group_id, artifact_id)
-
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    """命令行入口（委托 adapter）。"""
+    _adapter.main()
 
 
 if __name__ == "__main__":

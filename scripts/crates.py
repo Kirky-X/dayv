@@ -4,17 +4,25 @@ crates.io (Rust) 包查询脚本
 支持包详情查询和关键词搜索
 """
 
-import json
-import sys
-from typing import Optional
+from functools import lru_cache
 from urllib.parse import quote
 
-from utils import fetch_json
+from base_ecosystem import BaseEcosystemAdapter
+from utils import fetch_json, register_cache
 
 
 # crates.io 基础 URL
 CRATES_API_URL = "https://crates.io/api/v1"
 CRATES_BASE_URL = "https://crates.io"
+
+
+# ============ 缓存（@lru_cache；resolve 模块级 fetch_json 以兼容 patch.object 测试）============
+@lru_cache(maxsize=512)
+def _fetch_cached(url: str) -> dict:
+    return fetch_json(url)
+
+
+register_cache(_fetch_cached.cache_clear)
 
 
 def parse_package_info(data: dict) -> dict:
@@ -41,10 +49,12 @@ def parse_package_info(data: dict) -> dict:
     versions_data = data.get("versions", [])
     versions = []
     for v in versions_data[:20]:  # 最多20个版本
-        versions.append({
-            "version": v.get("num", ""),
-            "date": v.get("created_at", "")[:10] if v.get("created_at") else "",
-        })
+        versions.append(
+            {
+                "version": v.get("num", ""),
+                "date": v.get("created_at", "")[:10] if v.get("created_at") else "",
+            }
+        )
 
     # 获取最新版本信息
     latest_version = crate.get("newest_version", "") or crate.get("max_version", "")
@@ -89,12 +99,14 @@ def parse_search_results(data: dict) -> dict:
 
     results = []
     for crate in crates[:10]:  # 最多10个结果
-        results.append({
-            "name": crate.get("name", ""),
-            "description": crate.get("description", ""),
-            "latest_version": crate.get("newest_version", ""),
-            "downloads": crate.get("downloads", 0),
-        })
+        results.append(
+            {
+                "name": crate.get("name", ""),
+                "description": crate.get("description", ""),
+                "latest_version": crate.get("newest_version", ""),
+                "downloads": crate.get("downloads", 0),
+            }
+        )
 
     return {
         "total": total,
@@ -102,56 +114,41 @@ def parse_search_results(data: dict) -> dict:
     }
 
 
+class CratesAdapter(BaseEcosystemAdapter):
+    """crates.io 特异逻辑：JSON API。"""
+
+    ECOSYSTEM_NAME = "crates"
+
+    def build_package_url(self, crate_name: str) -> str:
+        return f"{CRATES_API_URL}/crates/{quote(crate_name, safe='')}"
+
+    def build_search_url(self, keyword: str) -> str:
+        return f"{CRATES_API_URL}/crates?page=1&per_page=10&q={quote(keyword, safe='')}"
+
+    def parse_package_info(self, data: dict, *args) -> dict:
+        return parse_package_info(data)
+
+    def parse_search_results(self, data: dict) -> dict:
+        return parse_search_results(data)
+
+
+_adapter = CratesAdapter(fetcher=_fetch_cached)
+
+
+# ============ 向后兼容模块级 API ============
 def get_package(crate_name: str) -> dict:
-    """
-    获取 crates.io 包详情
-
-    Args:
-        crate_name: Crate 名称
-
-    Returns:
-        包信息字典
-    """
-    # 获取包基本信息（包含版本列表）
-    url = f"{CRATES_API_URL}/crates/{quote(crate_name, safe='')}"
-    data = fetch_json(url)
-    return parse_package_info(data)
+    """获取 crates.io 包详情（委托 adapter，第二次同 URL 走缓存）。"""
+    return _adapter.get_package(crate_name)
 
 
 def search_packages(keyword: str) -> dict:
-    """
-    搜索 crates.io 包
-
-    Args:
-        keyword: 搜索关键词
-
-    Returns:
-        搜索结果字典
-    """
-    url = f"{CRATES_API_URL}/crates?page=1&per_page=10&q={quote(keyword, safe='')}"
-    data = fetch_json(url)
-    return parse_search_results(data)
+    """搜索 crates.io 包（委托 adapter）。"""
+    return _adapter.search_packages(keyword)
 
 
 def main():
-    """命令行入口"""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python crates.py <crate-name>      # 查询包详情")
-        print("  python crates.py --search <keyword>  # 搜索包")
-        sys.exit(1)
-
-    if sys.argv[1] == "--search":
-        if len(sys.argv) < 3:
-            print("Error: 请提供搜索关键词")
-            sys.exit(1)
-        keyword = sys.argv[2]
-        result = search_packages(keyword)
-    else:
-        crate_name = sys.argv[1]
-        result = get_package(crate_name)
-
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    """命令行入口（委托 adapter）。"""
+    _adapter.main()
 
 
 if __name__ == "__main__":

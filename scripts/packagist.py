@@ -6,17 +6,25 @@ API 文档: https://packagist.org/apidoc
 包名格式: vendor/package (如: monolog/monolog)
 """
 
-import json
-import sys
-from typing import Optional
+from functools import lru_cache
 from urllib.parse import quote
 
-from utils import fetch_json
+from base_ecosystem import BaseEcosystemAdapter
+from utils import fetch_json, register_cache
 
 
 # Packagist API 基础 URL
 PACKAGIST_REPO_URL = "https://repo.packagist.org"
 PACKAGIST_BASE_URL = "https://packagist.org"
+
+
+# ============ 缓存（@lru_cache；resolve 模块级 fetch_json 以兼容 patch.object 测试）============
+@lru_cache(maxsize=512)
+def _fetch_cached(url: str) -> dict:
+    return fetch_json(url)
+
+
+register_cache(_fetch_cached.cache_clear)
 
 
 def parse_package_info(data: dict, package_name: str) -> dict:
@@ -104,11 +112,13 @@ def parse_search_results(data: dict) -> dict:
     raw_results = data.get("results", [])
     for pkg in raw_results[:10]:
         # Packagist search API 不直接返回 latest_version，用 url 字段占位
-        results.append({
-            "name": pkg.get("name", ""),
-            "description": pkg.get("description", ""),
-            "latest_version": "",
-        })
+        results.append(
+            {
+                "name": pkg.get("name", ""),
+                "description": pkg.get("description", ""),
+                "latest_version": "",
+            }
+        )
 
     total = data.get("total", len(results))
     return {
@@ -117,59 +127,47 @@ def parse_search_results(data: dict) -> dict:
     }
 
 
+class PackagistAdapter(BaseEcosystemAdapter):
+    """Packagist 特异逻辑：p2 JSON API + vendor/package 双段名校验。"""
+
+    ECOSYSTEM_NAME = "packagist"
+    PACKAGE_USAGE_HINT = "<vendor/package>"
+    PACKAGE_FORMAT_ERROR = "Packagist 包名格式为 vendor/package (如 monolog/monolog)"
+
+    def validate_package_arg(self, arg: str) -> bool:
+        return "/" in arg
+
+    def build_package_url(self, package_name: str) -> str:
+        # package_name 形如 "monolog/monolog"，safe='/' 保留分隔符
+        return f"{PACKAGIST_REPO_URL}/p2/{quote(package_name, safe='/')}.json"
+
+    def build_search_url(self, keyword: str) -> str:
+        return f"{PACKAGIST_BASE_URL}/search.json?q={quote(keyword)}"
+
+    def parse_package_info(self, data: dict, package_name: str) -> dict:
+        return parse_package_info(data, package_name)
+
+    def parse_search_results(self, data: dict) -> dict:
+        return parse_search_results(data)
+
+
+_adapter = PackagistAdapter(fetcher=_fetch_cached)
+
+
+# ============ 向后兼容模块级 API ============
 def get_package(package_name: str) -> dict:
-    """
-    获取 Packagist 包详情
-
-    Args:
-        package_name: 包名 (vendor/package，如 monolog/monolog)
-
-    Returns:
-        包信息字典
-    """
-    # package_name 形如 "monolog/monolog"，URL 拼接
-    url = f"{PACKAGIST_REPO_URL}/p2/{quote(package_name, safe='/')}.json"
-    data = fetch_json(url)
-    return parse_package_info(data, package_name)
+    """获取 Packagist 包详情（委托 adapter，第二次同 URL 走缓存）。"""
+    return _adapter.get_package(package_name)
 
 
 def search_packages(keyword: str) -> dict:
-    """
-    搜索 Packagist 包
-
-    Args:
-        keyword: 搜索关键词
-
-    Returns:
-        搜索结果字典
-    """
-    url = f"{PACKAGIST_BASE_URL}/search.json?q={quote(keyword)}"
-    data = fetch_json(url)
-    return parse_search_results(data)
+    """搜索 Packagist 包（委托 adapter）。"""
+    return _adapter.search_packages(keyword)
 
 
 def main():
-    """命令行入口"""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python packagist.py <vendor/package>       # 查询包详情")
-        print("  python packagist.py --search <keyword>     # 搜索包")
-        sys.exit(1)
-
-    if sys.argv[1] == "--search":
-        if len(sys.argv) < 3:
-            print("Error: 请提供搜索关键词")
-            sys.exit(1)
-        keyword = sys.argv[2]
-        result = search_packages(keyword)
-    else:
-        package_name = sys.argv[1]
-        if "/" not in package_name:
-            print("Error: Packagist 包名格式为 vendor/package (如 monolog/monolog)")
-            sys.exit(1)
-        result = get_package(package_name)
-
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    """命令行入口（委托 adapter）。"""
+    _adapter.main()
 
 
 if __name__ == "__main__":

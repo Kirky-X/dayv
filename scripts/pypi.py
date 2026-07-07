@@ -4,19 +4,27 @@ PyPI 包查询脚本
 支持包详情查询和关键词搜索
 """
 
-import json
 import re
-import sys
-from typing import Optional
+from functools import lru_cache
 from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
-from utils import fetch_html
+from base_ecosystem import BaseEcosystemAdapter
+from utils import fetch_html, register_cache
 
 
 # PyPI 基础 URL
 PYPI_BASE_URL = "https://pypi.org"
+
+
+# ============ 缓存（@lru_cache；resolve 模块级 fetch_html 以兼容 patch.object 测试）============
+@lru_cache(maxsize=512)
+def _fetch_cached(url: str) -> str:
+    return fetch_html(url)
+
+
+register_cache(_fetch_cached.cache_clear)
 
 
 def parse_package_info(html_content: str, package_name: str) -> dict:
@@ -41,7 +49,7 @@ def parse_package_info(html_content: str, package_name: str) -> dict:
     version_elem = soup.select_one("h1.package-header__name")
     if version_elem:
         version_text = version_elem.get_text(strip=True)
-        match = re.search(r'(\d+\.\d+\.\d+)', version_text)
+        match = re.search(r"(\d+\.\d+\.\d+)", version_text)
         if match:
             version = match.group(1)
 
@@ -73,12 +81,12 @@ def parse_package_info(html_content: str, package_name: str) -> dict:
         date_elem = row.select_one("time, .grey")
         if ver_elem:
             ver_text = ver_elem.get_text(strip=True)
-            ver_match = re.search(r'(\d+\.\d+\.\d+)', ver_text)
+            ver_match = re.search(r"(\d+\.\d+\.\d+)", ver_text)
             if ver_match:
                 date = ""
                 if date_elem:
                     date_text = date_elem.get_text(strip=True)
-                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', date_text)
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", date_text)
                     if date_match:
                         date = date_match.group(1)
                 versions.append({"version": ver_match.group(1), "date": date})
@@ -94,7 +102,7 @@ def parse_package_info(html_content: str, package_name: str) -> dict:
             if not line or line.lower().startswith("requires"):
                 continue
             # 匹配 "package (version)" 或 "package>=version"
-            match = re.match(r'([a-zA-Z0-9_-]+)\s*(.+)?', line)
+            match = re.match(r"([a-zA-Z0-9_-]+)\s*(.+)?", line)
             if match:
                 dep_name = match.group(1)
                 dep_ver = match.group(2).strip().strip("()") if match.group(2) else "*"
@@ -106,7 +114,7 @@ def parse_package_info(html_content: str, package_name: str) -> dict:
         if install_code:
             code_text = install_code.get_text()
             # 查找 requirements 格式
-            req_match = re.findall(r'([a-zA-Z0-9_-]+)\s*[><=!~]+', code_text)
+            req_match = re.findall(r"([a-zA-Z0-9_-]+)\s*[><=!~]+", code_text)
             for req in req_match:
                 if req and req not in dependencies:
                     dependencies[req] = "*"
@@ -150,11 +158,13 @@ def parse_search_results(html_content: str) -> dict:
         version = version_elem.get_text(strip=True) if version_elem else ""
 
         if name:
-            results.append({
-                "name": name,
-                "description": description,
-                "latest_version": version,
-            })
+            results.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "latest_version": version,
+                }
+            )
 
     # 尝试提取总数
     total = len(results)
@@ -165,55 +175,41 @@ def parse_search_results(html_content: str) -> dict:
     }
 
 
+class PyPiAdapter(BaseEcosystemAdapter):
+    """PyPI 特异逻辑：HTML 抓取 + BeautifulSoup 解析。"""
+
+    ECOSYSTEM_NAME = "pypi"
+
+    def build_package_url(self, package_name: str) -> str:
+        return f"{PYPI_BASE_URL}/project/{quote(package_name, safe='')}/"
+
+    def build_search_url(self, keyword: str) -> str:
+        return f"{PYPI_BASE_URL}/search/?q={quote(keyword, safe='')}"
+
+    def parse_package_info(self, html_content: str, package_name: str) -> dict:
+        return parse_package_info(html_content, package_name)
+
+    def parse_search_results(self, html_content: str) -> dict:
+        return parse_search_results(html_content)
+
+
+_adapter = PyPiAdapter(fetcher=_fetch_cached)
+
+
+# ============ 向后兼容模块级 API（测试与现有调用方依赖）============
 def get_package(package_name: str) -> dict:
-    """
-    获取 PyPI 包详情
-
-    Args:
-        package_name: 包名称
-
-    Returns:
-        包信息字典
-    """
-    url = f"{PYPI_BASE_URL}/project/{quote(package_name, safe='')}/"
-    html = fetch_html(url)
-    return parse_package_info(html, package_name)
+    """获取 PyPI 包详情（委托 adapter，第二次同 URL 走缓存）。"""
+    return _adapter.get_package(package_name)
 
 
 def search_packages(keyword: str) -> dict:
-    """
-    搜索 PyPI 包
-
-    Args:
-        keyword: 搜索关键词
-
-    Returns:
-        搜索结果字典
-    """
-    url = f"{PYPI_BASE_URL}/search/?q={quote(keyword, safe='')}"
-    html = fetch_html(url)
-    return parse_search_results(html)
+    """搜索 PyPI 包（委托 adapter）。"""
+    return _adapter.search_packages(keyword)
 
 
 def main():
-    """命令行入口"""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python pypi.py <package-name>       # 查询包详情")
-        print("  python pypi.py --search <keyword>   # 搜索包")
-        sys.exit(1)
-
-    if sys.argv[1] == "--search":
-        if len(sys.argv) < 3:
-            print("Error: 请提供搜索关键词")
-            sys.exit(1)
-        keyword = sys.argv[2]
-        result = search_packages(keyword)
-    else:
-        package_name = sys.argv[1]
-        result = get_package(package_name)
-
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    """命令行入口（委托 adapter）。"""
+    _adapter.main()
 
 
 if __name__ == "__main__":

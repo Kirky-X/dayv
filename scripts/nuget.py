@@ -6,17 +6,25 @@ API 文档: https://learn.microsoft.com/nuget/api/overview
 NuGet V3 API 要求 package id 在 URL 中全小写。
 """
 
-import json
-import sys
-from typing import Optional
+from functools import lru_cache
 from urllib.parse import quote
 
-from utils import fetch_json
+from base_ecosystem import BaseEcosystemAdapter
+from utils import fetch_json, register_cache
 
 
 # NuGet API 基础 URL
 NUGET_REGISTRATION_URL = "https://api.nuget.org/v3/registration5-gz-semver2"
 NUGET_SEARCH_URL = "https://azuresearch-usnc.nuget.org"
+
+
+# ============ 缓存（@lru_cache；resolve 模块级 fetch_json 以兼容 patch.object 测试）============
+@lru_cache(maxsize=512)
+def _fetch_cached(url: str) -> dict:
+    return fetch_json(url)
+
+
+register_cache(_fetch_cached.cache_clear)
 
 
 def parse_package_info(data: dict) -> dict:
@@ -81,7 +89,9 @@ def parse_package_info(data: dict) -> dict:
             if not latest_version and version:
                 latest_version = version
                 description = catalog_entry.get("description", "")
-                license = catalog_entry.get("licenseExpression", "") or catalog_entry.get("licenseUrl", "")
+                license = catalog_entry.get(
+                    "licenseExpression", ""
+                ) or catalog_entry.get("licenseUrl", "")
                 homepage = catalog_entry.get("projectUrl", "")
                 # 提取依赖
                 dep_groups = catalog_entry.get("dependencyGroups", [])
@@ -123,11 +133,13 @@ def parse_search_results(data: dict) -> dict:
     results = []
     raw_data = data.get("data", [])
     for pkg in raw_data[:10]:
-        results.append({
-            "name": pkg.get("id", ""),
-            "description": pkg.get("description", ""),
-            "latest_version": pkg.get("version", ""),
-        })
+        results.append(
+            {
+                "name": pkg.get("id", ""),
+                "description": pkg.get("description", ""),
+                "latest_version": pkg.get("version", ""),
+            }
+        )
 
     total = data.get("totalHits", len(results))
     return {
@@ -136,59 +148,44 @@ def parse_search_results(data: dict) -> dict:
     }
 
 
+class NuGetAdapter(BaseEcosystemAdapter):
+    """NuGet 特异逻辑：V3 registration JSON API，URL 中 package id 必须全小写。"""
+
+    ECOSYSTEM_NAME = "nuget"
+
+    def build_package_url(self, package_name: str) -> str:
+        # URL 中强制小写并 URL encode（NuGet V3 API 要求 package id 全小写）；
+        # 原始大小写由 parse_package_info 从响应 catalogEntry.id 还原
+        encoded_name = quote(package_name.lower(), safe="")
+        return f"{NUGET_REGISTRATION_URL}/{encoded_name}/index.json"
+
+    def build_search_url(self, keyword: str) -> str:
+        return f"{NUGET_SEARCH_URL}/query?q={quote(keyword, safe='')}"
+
+    def parse_package_info(self, data: dict, *args) -> dict:
+        return parse_package_info(data)
+
+    def parse_search_results(self, data: dict) -> dict:
+        return parse_search_results(data)
+
+
+_adapter = NuGetAdapter(fetcher=_fetch_cached)
+
+
+# ============ 向后兼容模块级 API ============
 def get_package(package_name: str) -> dict:
-    """
-    获取 NuGet 包详情
-
-    NuGet V3 API 要求 package id 在 URL 中全小写。
-
-    Args:
-        package_name: 包名（用户可传任意大小写）
-
-    Returns:
-        包信息字典（name 保留原始大小写）
-    """
-    # URL 中强制小写并 URL encode（NuGet V3 API 要求 package id 全小写）
-    encoded_name = quote(package_name.lower(), safe='')
-    url = f"{NUGET_REGISTRATION_URL}/{encoded_name}/index.json"
-    data = fetch_json(url)
-    return parse_package_info(data)
+    """获取 NuGet 包详情（委托 adapter，第二次同 URL 走缓存；name 保留原始大小写）。"""
+    return _adapter.get_package(package_name)
 
 
 def search_packages(keyword: str) -> dict:
-    """
-    搜索 NuGet 包
-
-    Args:
-        keyword: 搜索关键词
-
-    Returns:
-        搜索结果字典
-    """
-    url = f"{NUGET_SEARCH_URL}/query?q={quote(keyword, safe='')}"
-    data = fetch_json(url)
-    return parse_search_results(data)
+    """搜索 NuGet 包（委托 adapter）。"""
+    return _adapter.search_packages(keyword)
 
 
 def main():
-    """命令行入口"""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python nuget.py <package-id>       # 查询包详情")
-        print("  python nuget.py --search <keyword>  # 搜索包")
-        sys.exit(1)
-
-    if sys.argv[1] == "--search":
-        if len(sys.argv) < 3:
-            print("Error: 请提供搜索关键词")
-            sys.exit(1)
-        keyword = sys.argv[2]
-        result = search_packages(keyword)
-    else:
-        package_name = sys.argv[1]
-        result = get_package(package_name)
-
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    """命令行入口（委托 adapter）。"""
+    _adapter.main()
 
 
 if __name__ == "__main__":

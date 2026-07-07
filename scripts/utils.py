@@ -7,6 +7,7 @@ Dependency Skill - 共享工具模块
 import logging
 import random
 import time
+from functools import lru_cache
 from typing import Optional, List, Tuple
 
 import httpx
@@ -42,7 +43,10 @@ class RequestClient:
         delay = random.uniform(MIN_DELAY, MAX_DELAY)
         time.sleep(delay)
 
-    def _get_headers(self, accept: str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8") -> dict:
+    def _get_headers(
+        self,
+        accept: str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    ) -> dict:
         """生成随机浏览器 Headers"""
         ua = str(ua_generator.generate())
         return {
@@ -83,7 +87,9 @@ class RequestClient:
                 request_headers.update(headers)
 
                 with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-                    response = client.request(method, url, headers=request_headers, **kwargs)
+                    response = client.request(
+                        method, url, headers=request_headers, **kwargs
+                    )
                     response.raise_for_status()
                     self._last_request_time = time.time()
                     return response
@@ -91,13 +97,13 @@ class RequestClient:
             except httpx.HTTPStatusError as e:
                 # 429 (Too Many Requests) 是限流，可重试；其他 4xx/5xx 不重试
                 if e.response.status_code == 429 and attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
                     continue
                 raise
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 if attempt < MAX_RETRIES - 1:
                     # 重试前稍长延迟
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
                     continue
                 raise
 
@@ -106,6 +112,10 @@ class RequestClient:
     def get(self, url: str, **kwargs) -> httpx.Response:
         """发送 GET 请求"""
         return self._request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs) -> httpx.Response:
+        """发送 POST 请求（复用重试 + 随机延迟机制）"""
+        return self._request("POST", url, **kwargs)
 
 
 def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
@@ -145,6 +155,98 @@ def fetch_json(url: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
     headers = {"Accept": "application/json"}
     response = client.get(url, headers=headers)
     return response.json()
+
+
+# 缓存上限（同会话内 URL 维度去重，减少重复 registry 请求）
+_FETCH_CACHE_MAXSIZE = 512
+
+
+@lru_cache(maxsize=_FETCH_CACHE_MAXSIZE)
+def fetch_json_cached(url: str) -> dict:
+    """lru_cache 版 fetch_json（按 URL 缓存，默认 timeout）。
+
+    适用于包元数据查询（同会话内 URL 返回值不变）。返回的 dict 必须视为只读——
+    多处共享同一对象，修改会污染缓存。需要自定义 timeout 或跳过缓存请用 fetch_json。
+    """
+    return fetch_json(url)
+
+
+@lru_cache(maxsize=_FETCH_CACHE_MAXSIZE)
+def fetch_html_cached(url: str) -> str:
+    """lru_cache 版 fetch_html（按 URL 缓存，默认 timeout）。"""
+    return fetch_html(url)
+
+
+# ============ 缓存注册表（测试隔离用）============
+# 各 ecosystem 子脚本 import 时 register_cache(_fetch_cached.cache_clear)，
+# clear_fetch_cache() 一次性清空全部 lru_cache，避免跨用例污染（缓存命中干扰 fetch 计数断言）。
+_CACHE_CLEARERS: List = []
+
+
+def register_cache(clear_fn) -> None:
+    """注册一个 lru_cache 的 cache_clear 回调（子脚本 import 时调用）。
+
+    Args:
+        clear_fn: 通常是某 @lru_cache 函数的 .cache_clear 绑定方法。
+    """
+    if clear_fn not in _CACHE_CLEARERS:
+        _CACHE_CLEARERS.append(clear_fn)
+
+
+def clear_fetch_cache() -> None:
+    """清空所有已注册的 fetch lru_cache（utils 内置 + 7 个 ecosystem 子脚本）。
+
+    主要供测试在用例间调用，避免上一用例的缓存命中干扰下一用例的 fetch 计数断言。
+    """
+    fetch_json_cached.cache_clear()
+    fetch_html_cached.cache_clear()
+    for clear_fn in _CACHE_CLEARERS:
+        try:
+            clear_fn()
+        except Exception:
+            logger.debug("清理 fetch 缓存失败", exc_info=True)
+
+
+# ============ 并发 fetch（registry 包查询并发）============
+
+
+def fetch_json_concurrent(
+    urls: List[str], max_workers: int = 4, timeout: float = DEFAULT_TIMEOUT
+) -> List[Optional[dict]]:
+    """
+    并发获取多个 registry JSON URL（ThreadPoolExecutor，保留限流）。
+
+    限流保留点：
+    - max_workers 上限（默认 4，避免触发 429）
+    - 每个请求仍走 RequestClient 的随机延迟（_random_delay）+ 429 重试
+
+    Args:
+        urls: URL 列表
+        max_workers: 线程池上限（默认 4）
+        timeout: 单请求超时（秒）
+
+    Returns:
+        与 urls 同序的结果列表；单个 URL 失败对应位置为 None（不抛异常，由调用方降级）
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: List[Optional[dict]] = [None] * len(urls)
+
+    def _one(idx: int, url: str) -> None:
+        try:
+            results[idx] = fetch_json(url, timeout=timeout)
+        except Exception as e:
+            logger.debug(f"并发 fetch 失败 {url}: {e}")
+            results[idx] = None
+
+    if not urls:
+        return results
+
+    workers = max(1, min(max_workers, len(urls)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        # materialize to surface exceptions inside _one (already swallowed)
+        list(ex.map(lambda pair: _one(pair[0], pair[1]), enumerate(urls)))
+    return results
 
 
 def safe_get(data: dict, *keys, default: str = "") -> str:
@@ -187,10 +289,10 @@ def compare_versions(v1: str, v2: str) -> int:
         # 清理版本号（移除前缀如 v, =, ^, ~ 等）
         clean_v1 = clean_version_string(v1)
         clean_v2 = clean_version_string(v2)
-        
+
         ver1 = semver.Version.parse(clean_v1)
         ver2 = semver.Version.parse(clean_v2)
-        
+
         if ver1 < ver2:
             return -1
         elif ver1 > ver2:
@@ -214,14 +316,14 @@ def clean_version_string(version: str) -> str:
     """
     if not version:
         return ""
-    
+
     # 移除常见前缀: v, =, ^, ~, >=, <=, >, <
     cleaned = version.strip()
-    cleaned = cleaned.lstrip('vV')
-    cleaned = cleaned.lstrip('=^~')
-    cleaned = cleaned.lstrip('><')
-    cleaned = cleaned.lstrip('=')
-    
+    cleaned = cleaned.lstrip("vV")
+    cleaned = cleaned.lstrip("=^~")
+    cleaned = cleaned.lstrip("><")
+    cleaned = cleaned.lstrip("=")
+
     return cleaned
 
 
@@ -254,15 +356,22 @@ def sort_versions(versions: List[str], reverse: bool = True) -> List[str]:
     Returns:
         排序后的版本号列表
     """
+
     def version_key(v):
         try:
             clean_v = clean_version_string(v)
             ver = semver.Version.parse(clean_v)
-            return (ver.major, ver.minor, ver.patch, ver.prerelease or "", ver.build or "")
+            return (
+                ver.major,
+                ver.minor,
+                ver.patch,
+                ver.prerelease or "",
+                ver.build or "",
+            )
         except (ValueError, TypeError):
             # 无效版本号排在最后
             return (-1, -1, -1, "", "")
-    
+
     return sorted(versions, key=version_key, reverse=reverse)
 
 
@@ -280,20 +389,20 @@ def check_version_constraint(version: str, constraint: str) -> bool:
     try:
         clean_ver = clean_version_string(version)
         ver = semver.Version.parse(clean_ver)
-        
+
         # 解析约束
         constraint = constraint.strip()
-        
+
         # 处理复合约束 (逗号分隔)
-        if ',' in constraint:
-            sub_constraints = [c.strip() for c in constraint.split(',')]
+        if "," in constraint:
+            sub_constraints = [c.strip() for c in constraint.split(",")]
             return all(check_version_constraint(version, c) for c in sub_constraints)
-        
+
         # 精确匹配
         if constraint.startswith("=") and not constraint.startswith("=="):
             target = clean_version_string(constraint[1:])
             return ver == semver.Version.parse(target)
-        
+
         # 范围匹配 (>=, <=, >, <, ==)
         if constraint.startswith(">="):
             target = clean_version_string(constraint[2:])
@@ -313,35 +422,39 @@ def check_version_constraint(version: str, constraint: str) -> bool:
         elif constraint.startswith("!="):
             target = clean_version_string(constraint[2:])
             return ver != semver.Version.parse(target)
-        
+
         # npm 风格的 ^ (兼容主版本)
         elif constraint.startswith("^"):
             target = clean_version_string(constraint[1:])
             target_ver = semver.Version.parse(target)
-            return (ver.major == target_ver.major and ver >= target_ver)
-        
+            return ver.major == target_ver.major and ver >= target_ver
+
         # npm 风格的 ~ (兼容次版本)
         elif constraint.startswith("~"):
             target = clean_version_string(constraint[1:])
             target_ver = semver.Version.parse(target)
-            return (ver.major == target_ver.major and 
-                   ver.minor == target_ver.minor and 
-                   ver >= target_ver)
-        
+            return (
+                ver.major == target_ver.major
+                and ver.minor == target_ver.minor
+                and ver >= target_ver
+            )
+
         # Python 风格的 ~= (兼容发布)
         elif constraint.startswith("~="):
             target = clean_version_string(constraint[2:])
             target_ver = semver.Version.parse(target)
             # ~=X.Y 意味着 >=X.Y, ==X.*
-            return (ver.major == target_ver.major and 
-                   ver.minor == target_ver.minor and 
-                   ver >= target_ver)
-        
+            return (
+                ver.major == target_ver.major
+                and ver.minor == target_ver.minor
+                and ver >= target_ver
+            )
+
         # 精确匹配（无前缀）
         else:
             target = clean_version_string(constraint)
             return ver == semver.Version.parse(target)
-            
+
     except (ValueError, TypeError):
         return False
 
@@ -359,13 +472,13 @@ def find_latest_version(versions: List[str], constraint: str = None) -> Optional
     """
     # 先排序
     sorted_versions = sort_versions(versions, reverse=True)
-    
+
     if not constraint:
         return sorted_versions[0] if sorted_versions else None
-    
+
     # 查找第一个满足约束的版本
     for version in sorted_versions:
         if check_version_constraint(version, constraint):
             return version
-    
+
     return None
