@@ -53,8 +53,8 @@ npx skills add https://github.com/Kirky-X/dayv.git --agent claude-code -y
 # 等价简写（owner/repo）
 npx skills add Kirky-X/dayv --agent claude-code -y
 
-# 安装到 Trae
-npx skills add Kirky-X/dayv --agent trae -y
+# 安装到 Codex
+npx skills add Kirky-X/dayv --agent codex -y
 
 # 列出仓库中可被发现的所有 skills（不安装）
 npx skills add https://github.com/Kirky-X/dayv.git --list
@@ -69,9 +69,8 @@ git clone https://github.com/Kirky-X/dayv.git
 # 将 SKILL.md + scripts/ 链接或复制到 agent skills 目录
 # 各 runtime 的 skills 目录路径示例（任选其一）：
 #   Claude Code:  ~/.claude/skills/dayv/
-#   Trae:         ~/.trae-cn/skills/dayv/
-#   Cursor:       ~/.cursor/skills/dayv/
 #   Codex:        ~/.codex/skills/dayv/
+#   Cursor:       ~/.cursor/skills/dayv/
 ```
 
 ## 使用示例
