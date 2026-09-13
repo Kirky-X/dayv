@@ -6,13 +6,21 @@ Dependency Skill - 共享工具模块
 
 import logging
 import random
+import sys
 import time
 from functools import lru_cache
 from typing import Optional, List, Tuple
 
-import httpx
-import ua_generator
-import semver
+try:
+    import httpx
+    import ua_generator
+    import semver
+except ImportError as _e:
+    sys.stderr.write(
+        f"错误：缺少依赖 {_e.name}（网络请求/版本解析必需）。\n"
+        "请在 skill 根目录执行: pip install -r requirements.txt\n"
+    )
+    sys.exit(1)
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -207,46 +215,8 @@ def clear_fetch_cache() -> None:
             logger.debug("清理 fetch 缓存失败", exc_info=True)
 
 
-# ============ 并发 fetch（registry 包查询并发）============
-
-
-def fetch_json_concurrent(
-    urls: List[str], max_workers: int = 4, timeout: float = DEFAULT_TIMEOUT
-) -> List[Optional[dict]]:
-    """
-    并发获取多个 registry JSON URL（ThreadPoolExecutor，保留限流）。
-
-    限流保留点：
-    - max_workers 上限（默认 4，避免触发 429）
-    - 每个请求仍走 RequestClient 的随机延迟（_random_delay）+ 429 重试
-
-    Args:
-        urls: URL 列表
-        max_workers: 线程池上限（默认 4）
-        timeout: 单请求超时（秒）
-
-    Returns:
-        与 urls 同序的结果列表；单个 URL 失败对应位置为 None（不抛异常，由调用方降级）
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    results: List[Optional[dict]] = [None] * len(urls)
-
-    def _one(idx: int, url: str) -> None:
-        try:
-            results[idx] = fetch_json(url, timeout=timeout)
-        except Exception as e:
-            logger.debug(f"并发 fetch 失败 {url}: {e}")
-            results[idx] = None
-
-    if not urls:
-        return results
-
-    workers = max(1, min(max_workers, len(urls)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        # materialize to surface exceptions inside _one (already swallowed)
-        list(ex.map(lambda pair: _one(pair[0], pair[1]), enumerate(urls)))
-    return results
+# 说明：原 fetch_json_concurrent（4 线程并发 fetch）已删除——无任何调用方，
+# 且与 anti-patterns.md 的「并发红线：串行调用」直接矛盾（规则8/21）。
 
 
 def safe_get(data: dict, *keys, default: str = "") -> str:

@@ -1,0 +1,12 @@
+# dayv（大禹）依赖分析引擎运行依赖
+# 安装：pip install -r requirements.txt
+# 说明：real-ladybug 为图数据库（依赖关系存储，必需）；
+#       weasyprint 仅 PDF 报告需要，缺失时相关子命令会显式报错（不影响其他功能）。
+
+real-ladybug>=0.15.0
+httpx>=0.27.0
+ua-generator>=2.0.0
+semver>=3.0.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+jinja2>=3.1.0

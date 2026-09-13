@@ -1,6 +1,6 @@
 # Core Features 详解
 
-> 依赖分析器 13 个核心功能的详细说明。命令速查见 [subcommands.md](./subcommands.md)。
+> 依赖分析器 11 个核心功能的详细说明。命令速查见 [subcommands.md](./subcommands.md)。
 
 ## 1. 依赖关系图分析
 

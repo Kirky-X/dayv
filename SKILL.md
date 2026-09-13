@@ -60,6 +60,12 @@ license: MIT
 
 ## Quick Start
 
+**首跑前置**（缺依赖时脚本会显式报错提示本步骤，不会带着裸 traceback 崩溃）：
+
+```bash
+pip install -r requirements.txt
+```
+
 ```bash
 python scripts/dependency_analyzer.py analyze /path/to/project              # 分析依赖树
 python scripts/dependency_analyzer.py query numpy                           # 查询包（默认 pypi）
@@ -82,7 +88,7 @@ python scripts/dependency_analyzer.py optimize /path/to/project --deep          
 
 ## Core Features
 
-14 个核心功能，每个复用独立脚本模块：
+11 个核心功能（与 CLI 实际子命令一致），每个复用独立脚本模块：
 
 1. **依赖关系图分析**（Ladybug GraphDB：Package/DependsOn/ConflictsWith/Vulnerability 节点）
 2. **版本冲突检测**（约束不满足/循环依赖/版本不兼容）
@@ -158,9 +164,8 @@ flowchart TD
 
 ## Testing & Validation
 
-- 10 个测试模块（renderer / health / sbom / visualizer / readme / impact / simulator / prioritizer / monitor / optimizer）
-- `python -m py_compile scripts/*.py` — 语法检查
-- `python -m pytest scripts/tests/ tests/ -v` — 全量测试
+- `python -m py_compile scripts/*.py` — 语法检查（所有脚本可通过）
+- 回归测试目录（`scripts/tests/`）未纳入 git，clone 后不可直接 pytest——验证以各子命令实际运行 + `--help` 输出核对为准
 - 完整验证步骤见 [`references/architecture.md`](references/architecture.md)
 
 ## Anti-patterns

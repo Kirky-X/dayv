@@ -33,7 +33,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import real_ladybug as lb
+try:
+    import real_ladybug as lb
+except ImportError:
+    import sys as _sys
+
+    _sys.stderr.write(
+        "错误：缺少依赖 real_ladybug（图数据库，必需）。\n"
+        "请在 skill 根目录执行: pip install -r requirements.txt\n"
+        "或单独安装: pip install real-ladybug\n"
+    )
+    _sys.exit(1)
 
 from utils import (
     RequestClient,
@@ -1221,21 +1231,37 @@ def detect_dependency_file(project_path: str) -> Optional[str]:
 
     # 如果传入的是目录，扫描查找依赖文件
     if path_obj.is_dir():
-        # 先按文件名精确匹配
+        # 先收集目录下所有生态的依赖文件（用于多生态共存时的显式提示，规则12：
+        # 静默缩小扫描范围是禁止的——生效/跳过清单必须展示）
+        detected: List[tuple] = []
         for filename, ecosystem in dependency_files.items():
             filepath = path_obj / filename
             if filepath.exists():
-                logger.info(f"检测到 {ecosystem} 项目: {filename}")
-                return str(filepath)
-        # 再按扩展名匹配（.csproj/.fsproj/.vbproj）
-        for filepath in path_obj.iterdir():
+                detected.append((ecosystem, filename, filepath))
+        for filepath in sorted(path_obj.iterdir()):
             if filepath.is_file():
                 suffix = filepath.suffix.lower()
                 if suffix in dependency_extensions:
-                    logger.info(
-                        f"检测到 {dependency_extensions[suffix]} 项目: {filepath.name}"
+                    detected.append(
+                        (dependency_extensions[suffix], filepath.name, filepath)
                     )
-                    return str(filepath)
+
+        if detected:
+            for eco, name, _ in detected:
+                logger.info(f"检测到 {eco} 项目: {name}")
+            distinct = {eco for eco, _, _ in detected}
+            if len(distinct) > 1:
+                effective = detected[0][1]
+                skipped = ", ".join(name for _, name, _ in detected[1:])
+                print(
+                    f"\n⚠️ 检测到多个生态的依赖文件，本次只分析生效文件: {effective}"
+                )
+                print(f"   跳过: {skipped}")
+                print(
+                    "   如需分析其他生态，请显式指定依赖文件路径"
+                    "（直接传入该文件路径）后重新运行。\n"
+                )
+            return str(detected[0][2])
 
     return None
 
@@ -1920,8 +1946,9 @@ def cmd_search(args):
 def cmd_security(args):
     """检查安全漏洞"""
     package_name = args.package
+    ecosystem = getattr(args, "ecosystem", "pypi")
 
-    print(f"正在检查包安全漏洞: {package_name}")
+    print(f"正在检查包安全漏洞: {package_name} (ecosystem: {ecosystem})")
     print("=" * 70)
 
     # 查询包真实最新版本（避免用假版本导致 false positive）
@@ -1930,7 +1957,10 @@ def cmd_security(args):
         import json as _json
         import subprocess as _sp
 
-        script_path = Path(__file__).parent / "pypi.py"
+        script_path = Path(__file__).parent / f"{ecosystem}.py"
+        if not script_path.exists():
+            print(f"\n❌ 不支持 ecosystem={ecosystem}（找不到 {script_path.name}）")
+            return
         result = _sp.run(
             [sys.executable, str(script_path), package_name],
             capture_output=True,
@@ -1957,7 +1987,7 @@ def cmd_security(args):
     try:
         # 用真实版本创建 DependencyNode
         pkg = DependencyNode(
-            name=package_name, version=latest_version, ecosystem="pypi"
+            name=package_name, version=latest_version, ecosystem=ecosystem
         )
 
         packages = [pkg]
@@ -2463,6 +2493,13 @@ def main():
     # security 命令
     security_parser = subparsers.add_parser("security", help="检查安全漏洞")
     security_parser.add_argument("package", help="包名")
+    security_parser.add_argument(
+        "-e",
+        "--ecosystem",
+        choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
+        default="pypi",
+        help="包生态系统 (默认: pypi)；决定用哪个 registry 查最新版本",
+    )
     security_parser.add_argument(
         "--priority",
         action="store_true",
