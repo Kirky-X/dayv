@@ -37,6 +37,8 @@ bash scripts/sync-skills.sh dayv
 
 # 首跑前置：安装依赖（缺依赖时子命令会显式报错提示本步骤，不会裸 traceback 崩溃）
 pip install -r requirements.txt
+# Option 3: Remote install (GitHub repo)
+npx skills add Kirky-X/dayv --agent claude-code -y
 ```
 
 `real-ladybug` (the graph database) is required; `weasyprint` is only needed for PDF reports — without it, the affected subcommands fail with explicit errors and other functionality is unaffected.
