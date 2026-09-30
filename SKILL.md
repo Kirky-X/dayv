@@ -3,6 +3,11 @@ name: dayv
 description: "依赖分析引擎（PyPI/npm/Maven 等 7 生态系统）。分析依赖树/冲突/漏洞，生成 HTML/PDF/SBOM/健康度，或优化依赖配置（去重/删冗余/识别未使用）。触发：dependency、依赖树、版本冲突、安全漏洞、package.json、pyproject.toml、Cargo.toml、SBOM、健康度、优化依赖"
 argument-hint: "<analyze|query|search|security|report|health|readme|simulate|monitor|optimize> [options]"
 license: MIT
+metadata:
+  version: "0.1.0"
+  author: "Kirky-X"
+  repo: "https://github.com/Kirky-X/dayv"
+  tags: "dependency, 依赖树, 版本冲突, 安全漏洞, package.json, Cargo.toml"
 ---
 
 # Dependency Analysis Skill · 大禹 (dayv) — 依赖分析引擎
@@ -157,6 +162,8 @@ flowchart TD
 | build            | 依赖分析 → 版本更新 → 构建     |
 | review           | 依赖冲突 → 安全漏洞 → 代码审查 |
 | security-expert  | 漏洞扫描 → 安全评估 → 修复建议 |
+
+外部工具（osv-scanner / syft / cyclonedx-cli）的能力对标、集成设计与引入决策见 [`references/external-tools-integration.md`](references/external-tools-integration.md)。dayv 当前**未集成任何外部二进制**，全部能力由 `scripts/` 自研实现。
 
 ## External Resources
 
