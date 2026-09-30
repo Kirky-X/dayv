@@ -133,13 +133,19 @@ def _score_stability(report: dict) -> float:
 
 def _score_license(report: dict) -> float:
     """
-    许可证合规性评分：report_dict 不含 license 信息时返回中性分
+    许可证合规性评分：按依赖包的真实许可证数据评分
 
-    注: 若调用方在 report 中传入 license_info 字段，则按风险等级评分：
-        - MIT/Apache-2.0/BSD/ISC: 100
-        - LGPL/MPL: 70
-        - GPL/AGPL: 40
-        - Unknown/Proprietary: 50
+    license_info 条目支持两种格式：
+      - {"package": name, "license": str}（report_to_dict 产出的标准格式，
+        无法获取 license 的包 license 为 "UNKNOWN"）
+      - 纯字符串（向后兼容旧调用方）
+
+    评分:
+      - MIT/Apache-2.0/BSD/ISC: 100
+      - LGPL/MPL: 70
+      - GPL/AGPL: 40
+      - UNKNOWN/空/其他: 50（未知许可证按保守中性风险计分）
+    无 license_info 数据（未采集）时返回中性分 75.0
     """
     license_info = report.get("license_info")
     if not license_info:
@@ -147,9 +153,12 @@ def _score_license(report: dict) -> float:
 
     # 按许可证列表评分
     scores = []
-    for lic in license_info:
-        lic_upper = (lic or "").upper()
-        if any(x in lic_upper for x in ["MIT", "APACHE-2.0", "BSD", "ISC"]):
+    for item in license_info:
+        lic = item.get("license", "") if isinstance(item, dict) else (item or "")
+        lic_upper = (lic or "").strip().upper()
+        if not lic_upper or lic_upper == "UNKNOWN":
+            scores.append(50.0)
+        elif any(x in lic_upper for x in ["MIT", "APACHE-2.0", "BSD", "ISC"]):
             scores.append(100.0)
         elif any(x in lic_upper for x in ["LGPL", "MPL"]):
             scores.append(70.0)

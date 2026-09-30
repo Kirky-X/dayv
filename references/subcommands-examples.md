@@ -24,6 +24,34 @@
   Description: Unintended leak of Proxy-Authorization header
 ```
 
+## deps_data.json schema
+
+`analyze-data` / `report` 子命令的输入（LLM 或外部工具手工整理）：
+
+```json
+{
+  "packages": [
+    {"name": "my-project", "version": "1.0.0", "ecosystem": "pypi", "is_root": true},
+    {"name": "requests", "version": "2.28.0", "ecosystem": "pypi", "is_root": false, "license": "Apache-2.0", "version_inferred": false}
+  ],
+  "edges": [
+    {"source": "my-project", "target": "requests", "constraint": ">=2.28.0"}
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `name` | 是 | 包名 |
+| `version` | 否 | 版本号。入口会用 `_extract_concrete_version` 归一化：范围串（`^1.2.0`/`>=2.0`）取下界并标 `version_inferred=true`；无法确定（`*`/`latest`/`1.2.x`/区间/排除式）置空串——禁止伪版本原样送 OSV 查询，空版本包在报告 `scan_warnings` 中显式列出 |
+| `ecosystem` | 否 | 默认 `pypi`；支持 pypi/npm/maven/crates/rubygems/packagist/nuget |
+| `is_root` | 否 | 默认 `false`；根包（项目自身）不出现在许可证合规范围 |
+| `license` | 否 | 已知许可证（如来自 lockfile/SBOM）；缺省时由 `enrich_licenses` 查 registry 回填，查不到报告层标 `UNKNOWN` |
+| `version_inferred` | 否 | 仅输出语义：`true` 表示 version 是范围约束推断的下界（OSV 受影响判定为保守近似），报告 `scan_warnings` 会汇总计数 |
+| `constraint` | 否 | 边上的原始版本约束串，默认 `*` |
+
 ## report.json schema
 
 `export_report_json` 输出：

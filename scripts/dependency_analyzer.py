@@ -110,6 +110,9 @@ class DependencyNode:
     version: str
     ecosystem: str  # pypi, npm, maven, crates
     is_root: bool = False
+    # version 是从范围约束（^1.2.0 / ~1.2.3 / >=2.0 等）推断的下界而非精确锁定。
+    # 无法得到确定版本的包 version 为空串（禁止编造 "0.0.0" 送 OSV 查询）。
+    version_inferred: bool = False
     properties: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -178,9 +181,43 @@ class AnalysisReport:
     graph_stats: Dict[str, Any]
     # 漏洞扫描状态告警（如 OSV 请求失败时显式标注"未扫描"，避免静默谎报"无漏洞"）
     scan_warnings: List[str] = field(default_factory=list)
+    # 依赖许可证合规数据：非根包的 license 列表；无法获取的显式标 "UNKNOWN"
+    license_info: List[Dict[str, str]] = field(default_factory=list)
 
 
 # ============ OSV 响应解析（纯函数，便于离线单测） ============
+
+
+def _classify_osv_packages(
+    packages: List[DependencyNode],
+) -> Tuple[List[DependencyNode], List[str], List[str]]:
+    """按 OSV 可查性把包分成三类（跳过原因分桶的唯一判定点）。
+
+    Returns:
+        (index, unmapped_ecosystem, no_version)
+        - index: 可提交查询的包（生态已映射且有确定版本）
+        - unmapped_ecosystem: 生态系统未映射 OSV 的包描述
+        - no_version: 无确定版本的包描述
+    """
+    index: List[DependencyNode] = []
+    unmapped: List[str] = []
+    no_version: List[str] = []
+    for pkg in packages:
+        if pkg.ecosystem not in OSV_ECOSYSTEM_MAP:
+            unmapped.append(f"{pkg.name}@{pkg.version} (ecosystem={pkg.ecosystem})")
+        elif not pkg.version:
+            no_version.append(f"{pkg.name} (无版本，OSV 无法判定受影响范围)")
+        else:
+            index.append(pkg)
+    return index, unmapped, no_version
+
+
+def _osv_query_for(pkg: DependencyNode) -> Dict[str, Any]:
+    """构造单个包的 OSV querybatch 查询项。"""
+    return {
+        "package": {"ecosystem": OSV_ECOSYSTEM_MAP[pkg.ecosystem], "name": pkg.name},
+        "version": pkg.version,
+    }
 
 
 def _build_osv_queries(
@@ -192,27 +229,11 @@ def _build_osv_queries(
         (queries, index, skipped)
         - queries: 与 index 等长对齐的 OSV query 列表
         - index: 实际提交查询的包（与 queries[k] 一一对应）
-        - skipped: 被跳过的包描述（生态系统未映射 / 无版本）
+        - skipped: 被跳过的包描述（生态系统未映射 / 无版本，扁平列表）
     """
-    queries: List[Dict[str, Any]] = []
-    index: List[DependencyNode] = []
-    skipped: List[str] = []
-    for pkg in packages:
-        osv_eco = OSV_ECOSYSTEM_MAP.get(pkg.ecosystem)
-        if osv_eco is None:
-            skipped.append(f"{pkg.name}@{pkg.version} (ecosystem={pkg.ecosystem})")
-            continue
-        if not pkg.version:
-            skipped.append(f"{pkg.name} (无版本，OSV 无法判定受影响范围)")
-            continue
-        queries.append(
-            {
-                "package": {"ecosystem": osv_eco, "name": pkg.name},
-                "version": pkg.version,
-            }
-        )
-        index.append(pkg)
-    return queries, index, skipped
+    index, unmapped, no_version = _classify_osv_packages(packages)
+    queries = [_osv_query_for(pkg) for pkg in index]
+    return queries, index, unmapped + no_version
 
 
 def _parse_osv_results(
@@ -692,6 +713,42 @@ class DependencyGraphDB:
             logger.error(f"获取统计信息失败: {e}")
             return {}
 
+    def set_license(self, package_name: str, license_str: str) -> bool:
+        """回写包的 license 到图 DB（license 的单一存储点，见 enrich_licenses）。
+
+        Args:
+            package_name: 包名（Package 主键）
+            license_str: license 串；未获取到时为空串（数据层"无数据"语义）
+
+        Returns:
+            是否成功
+        """
+        try:
+            self.conn.execute(
+                """
+                MATCH (p:Package {name: $name})
+                SET p.license = $license
+                """,
+                {"name": package_name, "license": license_str},
+            )
+            return True
+        except Exception as e:
+            logger.error(f"回写 license 失败 {package_name}: {e}")
+            return False
+
+    def get_license_map(self) -> Dict[str, str]:
+        """读取全部包的 license（name -> license 串，未回写的为空串）。"""
+        try:
+            result = self.conn.execute("MATCH (p:Package) RETURN p.name, p.license")
+            licenses: Dict[str, str] = {}
+            while result.has_next():
+                name, lic = result.get_next()
+                licenses[name] = lic or ""
+            return licenses
+        except Exception as e:
+            logger.error(f"读取 license 失败: {e}")
+            return {}
+
     def close(self):
         """关闭数据库连接"""
         try:
@@ -711,6 +768,7 @@ class DependencyAnalyzer:
         self,
         db_path: Optional[str] = None,
         http_client: Optional[RequestClient] = None,
+        license_fetcher: Optional[Any] = None,
     ):
         """
         初始化分析器
@@ -719,9 +777,15 @@ class DependencyAnalyzer:
             db_path: 数据库路径
             http_client: 可选 HTTP 客户端（测试注入 mock 避免联网）；
                          默认新建 RequestClient（含重试 + 随机延迟）
+            license_fetcher: 可选 license 查询器（需有 fetch(name, ecosystem)
+                         -> dict，可选 fetch_many；见 enrich_licenses）。
+                         None 时内部构造 EcosystemFetcher。测试注入 mock 避免联网。
         """
         self.db = DependencyGraphDB(db_path)
         self._http = http_client or RequestClient(timeout=30.0)
+        self._license_fetcher = license_fetcher
+        # license 是否已采集回写 DB（见 _collect_license_info，每 analyzer 只采一次）
+        self._license_enriched = False
         # OSV 漏洞扫描状态：未扫描时显式标注，禁止静默谎报"无漏洞"
         self.osv_scan_status: Dict[str, Any] = {
             "scanned": False,
@@ -733,12 +797,14 @@ class DependencyAnalyzer:
 
         失败时显式记录 osv_scan_status（标注"未扫描"），不静默、不注入假漏洞。
         无网络/超时/解析失败都属于这条显式失败路径。
+        无确定版本的包被跳过时，跳过列表同样显式记录进 osv_scan_status，
+        由 generate_report 转入 scan_warnings 报告（禁止静默跳过）。
         """
         if not packages:
-            self.osv_scan_status = {"scanned": True, "found": 0}
+            self.osv_scan_status = {"scanned": True, "found": 0, "skipped": []}
             return
         try:
-            vulns = self._query_osv_batch(packages)
+            vulns, skipped, inferred_count = self._query_osv_batch(packages)
         except Exception as e:
             reason = f"OSV 漏洞扫描失败：{type(e).__name__}: {e}"
             logger.warning(
@@ -750,13 +816,18 @@ class DependencyAnalyzer:
                 "packages": [f"{p.name}@{p.version}" for p in packages],
             }
             return
-        self.osv_scan_status = {"scanned": True, "found": len(vulns)}
+        self.osv_scan_status = {
+            "scanned": True,
+            "found": len(vulns),
+            "skipped": skipped,
+            "inferred_count": inferred_count,
+        }
         for vuln in vulns:
             self.db.add_vulnerability(vuln)
 
     def _query_osv_batch(
         self, packages: List[DependencyNode]
-    ) -> List[SecurityVulnerability]:
+    ) -> Tuple[List[SecurityVulnerability], Dict[str, List[str]], int]:
         """批量查询 OSV (https://api.osv.dev/v1/querybatch)。
 
         - ecosystem 映射: pypi→PyPI / npm→npm / maven→Maven / crates→crates.io
@@ -765,17 +836,32 @@ class DependencyAnalyzer:
         - 复用 utils.RequestClient 的重试 + 随机延迟限流
         - 分片提交，每片 OSV_BATCH_CHUNK 个包
 
+        Returns:
+            (vulns, skipped, inferred_count) 三元组：
+            - vulns: 解析出的漏洞列表
+            - skipped: 按原因分桶的被跳过包描述
+              {"unmapped_ecosystem": [...], "no_version": [...]}
+            - inferred_count: 以推断下界版本提交查询的包数（结果为保守近似）
+
         Raises:
             httpx.HTTPError / ValueError: 网络/HTTP/JSON 解析失败时抛出
         """
-        queries, index, skipped = _build_osv_queries(packages)
-        if skipped:
+        index, unmapped, no_version = _classify_osv_packages(packages)
+        skipped: Dict[str, List[str]] = {
+            "unmapped_ecosystem": unmapped,
+            "no_version": no_version,
+        }
+        skipped_total = len(unmapped) + len(no_version)
+        if skipped_total:
             logger.info(
-                f"OSV 跳过 {len(skipped)} 个包（生态系统未映射或无版本）: {skipped[:5]}"
+                f"OSV 跳过 {skipped_total} 个包"
+                f"（生态系统未映射 {len(unmapped)} 个 / 无确定版本 {len(no_version)} 个）:"
+                f" {skipped}"
             )
-        if not queries:
-            return []
+        if not index:
+            return [], skipped, 0
 
+        queries = [_osv_query_for(pkg) for pkg in index]
         all_results: List[Dict[str, Any]] = []
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         for i in range(0, len(queries), OSV_BATCH_CHUNK):
@@ -806,7 +892,8 @@ class DependencyAnalyzer:
                         )
                 page_token = data.get("next_page_token")
 
-        return _parse_osv_results(index, all_results)
+        inferred_count = sum(1 for p in index if p.version_inferred)
+        return _parse_osv_results(index, all_results), skipped, inferred_count
 
     def build_dependency_graph(
         self, packages: List[DependencyNode], dependencies: List[DependencyEdge]
@@ -1093,6 +1180,26 @@ class DependencyAnalyzer:
         # 显式收集漏洞扫描状态告警（OSV 失败时不得静默谎报"无漏洞"）
         scan_warnings: List[str] = []
         status = self.osv_scan_status
+        skipped = (status or {}).get("skipped", {})
+        # skipped 按跳过原因分桶（生态未映射 ≠ 无确定版本，文案不得混桶）
+        unmapped = skipped.get("unmapped_ecosystem", []) if isinstance(skipped, dict) else []
+        no_version = skipped.get("no_version", []) if isinstance(skipped, dict) else []
+        if unmapped:
+            scan_warnings.append(
+                f"漏洞扫描跳过 {len(unmapped)} 个生态系统未映射的包"
+                f"（OSV 不支持该生态，未查询）：{unmapped}"
+            )
+        if no_version:
+            scan_warnings.append(
+                f"漏洞扫描跳过 {len(no_version)} 个无确定版本的包"
+                f"（范围/通配约束无法定位具体版本，未查询 OSV）：{no_version}"
+            )
+        inferred_count = (status or {}).get("inferred_count", 0)
+        if inferred_count:
+            scan_warnings.append(
+                f"漏洞扫描对 {inferred_count} 个包使用范围约束推断的下界版本"
+                f"（如 ^1.2.0 → 1.2.0），受影响判定为保守近似"
+            )
         if status and not status.get("scanned"):
             pkg_list = status.get("packages", [])
             scan_warnings.append(
@@ -1100,6 +1207,10 @@ class DependencyAnalyzer:
                 f"漏洞列表可能不完整（涉及 {len(pkg_list)} 个包），"
                 f"请检查网络后重试或人工核查。"
             )
+
+        # 采集依赖许可证（健康度"许可证合规"维度的真实数据源；
+        # 查询失败的包以 UNKNOWN 显式标注，不静默留空）
+        license_info = self._collect_license_info()
 
         report = AnalysisReport(
             timestamp=time.time(),
@@ -1112,9 +1223,49 @@ class DependencyAnalyzer:
             recommendations=recommendations_list,
             graph_stats=stats,
             scan_warnings=scan_warnings,
+            license_info=license_info,
         )
 
         return report
+
+    def _collect_license_info(self) -> List[Dict[str, str]]:
+        """从图 DB 读取全部非根包 license（license 的单一存储点是 Package.license）。
+
+        DB 尚无 license 数据时（本 analyzer 首次生成报告），先用 license_fetcher
+        采集一次并回写 DB（enrich_licenses），再从 DB 读——保证返回值永远是
+        DB 存储值而非临时节点属性。DB 中为空串（查询失败/registry 未返回）
+        的包在报告层以 "UNKNOWN" 显式标注，禁止静默留空。
+
+        Returns:
+            license_info 列表（供 report_to_dict 输出、健康度评分消费）
+        """
+        if not self._license_enriched:
+            nodes: List[DependencyNode] = []
+            result = self.db.conn.execute(
+                "MATCH (p:Package) RETURN p.name, p.ecosystem, p.is_root"
+            )
+            while result.has_next():
+                name, eco, is_root = result.get_next()
+                nodes.append(
+                    DependencyNode(
+                        name=name, version="", ecosystem=eco, is_root=bool(is_root)
+                    )
+                )
+            enrich_licenses(nodes, fetcher=self._license_fetcher, db=self.db)
+            self._license_enriched = True
+
+        result = self.db.conn.execute(
+            """
+            MATCH (p:Package) WHERE p.is_root = $is_root
+            RETURN p.name, p.license
+            """,
+            {"is_root": False},
+        )
+        license_info: List[Dict[str, str]] = []
+        while result.has_next():
+            name, lic = result.get_next()
+            license_info.append({"package": name, "license": lic or "UNKNOWN"})
+        return license_info
 
     def report_to_dict(self, report: AnalysisReport) -> Dict[str, Any]:
         """将 AnalysisReport 转换为 dict（供 JSON/HTML/PDF 渲染用）"""
@@ -1163,6 +1314,7 @@ class DependencyAnalyzer:
             ],
             "recommendations": report.recommendations,
             "scan_warnings": report.scan_warnings,
+            "license_info": report.license_info,
         }
 
     def export_report_json(self, report: AnalysisReport, output_file: str):
@@ -1266,6 +1418,67 @@ def detect_dependency_file(project_path: str) -> Optional[str]:
     return None
 
 
+# ============ 版本约束 → 确定版本解析（纯函数，便于离线单测） ============
+
+# 可作为确定版本送 OSV 的版本串：1-4 段数字 + 可选 prerelease/build 元数据
+_CONCRETE_VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.\-]+)?$")
+# 完整三段裸版本（含可选 prerelease）视为精确锁定
+_EXACT_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+].*)?$")
+# 下界型操作符：约束允许集合的最小值可从字面量推断
+_LOWER_BOUND_OP_RE = re.compile(r"^(?:\^|~=|~|>=|==|=)")
+# 上界/排除/严格大于：字面量不在允许集合内，不得当作受检版本
+_NON_MEMBER_OP_RE = re.compile(r"^(?:<=|<|!=|>)")
+
+
+def _extract_concrete_version(constraint: str) -> Optional[Tuple[str, bool]]:
+    """从单个版本约束提取确定版本（下界）。
+
+    Returns:
+        (version, inferred) 二元组：
+        - ("1.2.3", False)：精确锁定（裸三段版本或 ==/= 约束）
+        - ("1.2.0", True)：从范围约束推断的下界（^1.2.0 / ~1.2.3 / >=2.0 / ~=1.2 等）
+        None：无法得到确定版本（通配 */x、区间 ||、标签 latest、workspace:/file:/
+        git: 链接、纯上界 < / <=、排除 !=、严格大于 > 等）。
+
+        调用方约定：返回 None 的包禁止编造版本（如 "0.0.0"）送 OSV 查询，
+        必须跳过查询并在结果中显式报告跳过数量与原因。
+    """
+    if not constraint:
+        return None
+    text = constraint.strip()
+    if not text:
+        return None
+    # OR 复合约束存在多个候选集合，无法取唯一下界
+    if "||" in text:
+        return None
+    # AND 复合约束（npm 空格区间 / pip 逗号列表 / npm hyphen 区间）
+    # 取首个下界段；hyphen 区间第一段同样是下界
+    if re.search(r"\s-\s", text):
+        segment = re.split(r"\s-\s", text, maxsplit=1)[0].strip()
+        forced_inferred = True
+    else:
+        segment = re.split(r"[,\s]+", text, maxsplit=1)[0].strip()
+        forced_inferred = False
+
+    op_match = _LOWER_BOUND_OP_RE.match(segment)
+    if op_match:
+        operator = op_match.group(0)
+        version = segment[op_match.end() :].strip()
+        inferred = operator not in ("=", "==")
+    elif _NON_MEMBER_OP_RE.match(segment):
+        # < / <= / != / > 的字面量不属于允许集合，送 OSV 会得出错误结论
+        return None
+    else:
+        version = segment
+        # npm 裸两段（"1.2" ≡ 1.2.x）是 range 而非精确锁定
+        inferred = not bool(_EXACT_VERSION_RE.match(version))
+    if forced_inferred:
+        inferred = True
+    if not version or not _CONCRETE_VERSION_RE.match(version):
+        return None
+    return version, inferred
+
+
 def parse_pyproject_toml(
     project_path: str,
 ) -> tuple[List[DependencyNode], List[DependencyEdge]]:
@@ -1332,12 +1545,17 @@ def parse_pyproject_toml(
             pkg_name = match.group(1).lower()
             constraint = match.group(2).strip() if match.group(2) else "*"
 
-            # 提取版本号（简化处理）
-            ver_match = re.search(r">=?\s*([0-9][^,\s\]]*)", constraint)
-            version = ver_match.group(1) if ver_match else "0.0.0"
+            # 提取确定版本（下界）；无法确定时留空，禁止编造版本送 OSV
+            resolved = _extract_concrete_version(constraint)
+            version = resolved[0] if resolved else ""
 
             packages.append(
-                DependencyNode(name=pkg_name, version=version, ecosystem="pypi")
+                DependencyNode(
+                    name=pkg_name,
+                    version=version,
+                    ecosystem="pypi",
+                    version_inferred=resolved[1] if resolved else False,
+                )
             )
 
             edges.append(
@@ -1390,12 +1608,19 @@ def parse_package_json(
     all_deps.update(data.get("devDependencies", {}))
 
     for pkg_name, version_constraint in all_deps.items():
-        # 提取版本号
-        version = version_constraint.lstrip("^~>=<")
-        if not version or not version[0].isdigit():
-            version = "0.0.0"
+        # 提取确定版本（下界）；无法确定（*/latest/x 通配、区间）时留空，
+        # 由 OSV 查询侧跳过并在报告中显式标注，禁止编造版本
+        resolved = _extract_concrete_version(version_constraint)
+        version = resolved[0] if resolved else ""
 
-        packages.append(DependencyNode(name=pkg_name, version=version, ecosystem="npm"))
+        packages.append(
+            DependencyNode(
+                name=pkg_name,
+                version=version,
+                ecosystem="npm",
+                version_inferred=resolved[1] if resolved else False,
+            )
+        )
 
         edges.append(
             DependencyEdge(
@@ -1447,12 +1672,17 @@ def parse_requirements_txt(
             pkg_name = match.group(1).lower()
             constraint = match.group(2).strip() if match.group(2) else "*"
 
-            # 提取版本号
-            ver_match = re.search(r"[=<>!]+\s*([0-9][^,\s;]*)", constraint)
-            version = ver_match.group(1) if ver_match else "0.0.0"
+            # 提取确定版本（下界）；无法确定时留空，禁止编造版本送 OSV
+            resolved = _extract_concrete_version(constraint)
+            version = resolved[0] if resolved else ""
 
             packages.append(
-                DependencyNode(name=pkg_name, version=version, ecosystem="pypi")
+                DependencyNode(
+                    name=pkg_name,
+                    version=version,
+                    ecosystem="pypi",
+                    version_inferred=resolved[1] if resolved else False,
+                )
             )
 
     return packages, edges
@@ -1592,6 +1822,41 @@ def display_update_paths(update_paths: List[UpdatePath]):
         logger.info("无需更新")
 
 
+def _deps_data_to_graph(data: Dict[str, Any]) -> Tuple[List[DependencyNode], List[DependencyEdge]]:
+    """deps_data dict schema → (DependencyNode, DependencyEdge) 列表。
+
+    外部入口（analyze-data / report 的 deps_data.json 由 LLM 或工具手工整理）
+    的 version 字段可能是范围串/伪版本（"^1.2.0"、"1.2.x"、"*"），每个 version
+    都过一遍 _extract_concrete_version 归一化：可解析取下界并标 version_inferred，
+    无法确定（通配/区间/排除式）留空串——禁止伪版本原样送 OSV 查询。
+    """
+    packages = []
+    for pkg_data in data["packages"]:
+        raw_version = str(pkg_data.get("version", "") or "")
+        resolved = _extract_concrete_version(raw_version)
+        packages.append(
+            DependencyNode(
+                name=pkg_data["name"],
+                # 无确定版本留空（OSV 查询跳过并显式报告），禁止编造版本
+                version=resolved[0] if resolved else "",
+                ecosystem=pkg_data.get("ecosystem", "pypi"),
+                is_root=pkg_data.get("is_root", False),
+                version_inferred=resolved[1] if resolved else False,
+            )
+        )
+
+    edges = []
+    for edge_data in data["edges"]:
+        edges.append(
+            DependencyEdge(
+                source=edge_data["source"],
+                target=edge_data["target"],
+                constraint=edge_data.get("constraint", "*"),
+            )
+        )
+    return packages, edges
+
+
 def cmd_analyze_data(args):
     """分析依赖数据文件"""
     data_file = args.data_file
@@ -1616,27 +1881,8 @@ def cmd_analyze_data(args):
 
     logger.info(f"正在分析依赖数据: {data_file}")
 
-    # 解析数据
-    packages = []
-    for pkg_data in data["packages"]:
-        packages.append(
-            DependencyNode(
-                name=pkg_data["name"],
-                version=pkg_data.get("version", "0.0.0"),
-                ecosystem=pkg_data.get("ecosystem", "pypi"),
-                is_root=pkg_data.get("is_root", False),
-            )
-        )
-
-    edges = []
-    for edge_data in data["edges"]:
-        edges.append(
-            DependencyEdge(
-                source=edge_data["source"],
-                target=edge_data["target"],
-                constraint=edge_data.get("constraint", "*"),
-            )
-        )
+    # 解析数据（version 归一化见 _deps_data_to_graph）
+    packages, edges = _deps_data_to_graph(data)
 
     logger.info(f"加载 {len(packages)} 个包, {len(edges)} 个依赖关系")
 
@@ -1707,12 +1953,96 @@ def cmd_analyze_data(args):
             logger.error(f"关闭分析器时出错: {e}")
 
 
+def enrich_licenses(
+    packages: List[DependencyNode],
+    fetcher: Optional[Any] = None,
+    db: Optional["DependencyGraphDB"] = None,
+) -> List[Dict[str, str]]:
+    """批量查询 registry 采集依赖包 license，并回写图 DB（G1/G2 共用单一数据源）。
+
+    数据流（license 的单一存储点是图 DB 的 Package.license）：
+    - 只处理非根包（根包是项目自身，不属于依赖许可证合规范围）
+    - 查询结果经 db.set_license 回写 Package.license（DB 成为真正的存储点）；
+      同步写 node.properties["license"] 作为同进程纯函数（_to_deps_data /
+      SBOM）的传递载体；未获取到时为空串（数据层"无数据"语义，SBOM 端
+      回退 SPDX 标准的 NOASSERTION）
+    - 报告层（_collect_license_info）从 DB 读回，空串以 "UNKNOWN" 显式标注
+      （供健康度评分按未知风险计分）
+
+    性能注：批量协议为 EcosystemFetcher.fetch_many → 每个生态系统一次
+    `--batch` 子进程（内部 4 线程并发查 registry）。100 依赖此前需 ~100 个
+    Python 子进程（4 并发下 ≈ 40s，主要为解释器/导入启动开销），现降为
+    每生态 1 个子进程。fetch_many 整体异常时全员标 UNKNOWN——不回退逐包
+    串行 fetch（网络故障下 100 包 × 最坏 15s ≈ 25 分钟）。
+
+    Args:
+        packages: 依赖节点列表
+        fetcher: 可选 license 查询器（需有 fetch(name, ecosystem) -> dict，
+                 可选 fetch_many(items) -> {(name, eco): dict}，批量优先）；
+                 None 时构造 readme_generator.EcosystemFetcher（subprocess
+                 调 ecosystem 脚本）。测试注入 mock 避免联网。
+        db: 可选图 DB；提供时查询结果回写 Package.license（单一存储点）
+
+    Returns:
+        license_info 列表（与非根包等长同序）：
+        [{"package": name, "license": "MIT" | "UNKNOWN"}, ...]
+    """
+    dep_packages = [p for p in packages if not p.is_root]
+    if not dep_packages:
+        return []
+
+    if fetcher is None:
+        import readme_generator
+
+        fetcher = readme_generator.EcosystemFetcher()
+
+    use_batch = hasattr(fetcher, "fetch_many")
+    batch_failed = False
+    infos: Dict[Tuple[str, str], dict] = {}
+    if use_batch:
+        try:
+            infos = fetcher.fetch_many([(p.name, p.ecosystem) for p in dep_packages])
+        except Exception as e:
+            # 不回退逐包串行 fetch：网络故障下逐包重试最坏 O(n)×15s，
+            # 全员标 UNKNOWN（数据层空串 → 报告层 UNKNOWN 语义现成）
+            logger.warning(f"fetch_many 批量查询 license 失败，全员标 UNKNOWN: {e}")
+            batch_failed = True
+
+    license_info: List[Dict[str, str]] = []
+    for pkg in dep_packages:
+        info: dict = {}
+        if batch_failed:
+            pass  # 批量失败：该包显式 UNKNOWN，不做逐包串行重试
+        elif use_batch:
+            info = infos.get((pkg.name, pkg.ecosystem), {})
+        else:
+            # fetcher 无批量能力（如测试 mock）时的逐个查询路径
+            try:
+                info = fetcher.fetch(pkg.name, pkg.ecosystem) or {}
+            except Exception as e:
+                logger.debug(f"查询 {pkg.ecosystem}/{pkg.name} license 失败: {e}")
+                info = {}
+        license_str = (info or {}).get("license", "") or ""
+        # 数据层保持"无数据=空串"语义；报告层以 UNKNOWN 显式标注，禁止静默
+        pkg.properties["license"] = license_str
+        if db is not None:
+            db.set_license(pkg.name, license_str)
+        license_info.append(
+            {"package": pkg.name, "license": license_str or "UNKNOWN"}
+        )
+    return license_info
+
+
 def _to_deps_data(packages: List[DependencyNode], edges: List[DependencyEdge]) -> dict:
     """
     将 DependencyNode/Edge 列表转为 deps_data dict schema
 
-    用于 visualizer / readme_generator / impact_analyzer 等模块的输入
+    用于 visualizer / readme_generator / impact_analyzer / sbom_generator 等模块的输入
     （与 cmd_report 输入的 deps_data.json schema 一致）
+
+    license 取自 node.properties["license"]（enrich_licenses 的写入结果，
+    单一存储点是图 DB Package.license——cmd_readme 等调用方在 enrich 后
+    从 DB 读回覆盖此键）；未采集时为空串，SBOM 端以 NOASSERTION 显式标注
     """
     return {
         "packages": [
@@ -1721,6 +2051,7 @@ def _to_deps_data(packages: List[DependencyNode], edges: List[DependencyEdge]) -
                 "version": p.version,
                 "ecosystem": p.ecosystem,
                 "is_root": p.is_root,
+                "license": p.properties.get("license", ""),
             }
             for p in packages
         ],
@@ -2104,26 +2435,8 @@ def cmd_report(args):
         return
 
     # JSON/HTML/PDF：先生成分析报告
-    packages = []
-    for pkg_data in data["packages"]:
-        packages.append(
-            DependencyNode(
-                name=pkg_data["name"],
-                version=pkg_data.get("version", "0.0.0"),
-                ecosystem=pkg_data.get("ecosystem", "pypi"),
-                is_root=pkg_data.get("is_root", False),
-            )
-        )
-
-    edges = []
-    for edge_data in data["edges"]:
-        edges.append(
-            DependencyEdge(
-                source=edge_data["source"],
-                target=edge_data["target"],
-                constraint=edge_data.get("constraint", "*"),
-            )
-        )
+    # （version 归一化见 _deps_data_to_graph：伪版本/范围串不得原样送 OSV）
+    packages, edges = _deps_data_to_graph(data)
 
     analyzer = DependencyAnalyzer()
     try:
@@ -2226,12 +2539,27 @@ def cmd_readme(args):
     packages, edges, ecosystem = parse_dependencies(project_path)
     print(f"找到 {len(packages)} 个包, {len(edges)} 个依赖关系 (ecosystem={ecosystem})")
 
-    deps_data = _to_deps_data(packages, edges)
-
     # 用 EcosystemFetcher 查 registry 获取 description/license
     import readme_generator
 
     fetcher = readme_generator.EcosystemFetcher()
+
+    # license 单一数据源 = 图 DB：建图后 enrich 采集并回写 Package.license，
+    # deps_data 的 license 从 DB 读回（不复用临时节点属性传递）
+    analyzer = DependencyAnalyzer()
+    try:
+        analyzer.build_dependency_graph(packages, edges)
+        enrich_licenses(packages, fetcher=fetcher, db=analyzer.db)
+        deps_data = _to_deps_data(packages, edges)
+        license_map = analyzer.db.get_license_map()
+    finally:
+        try:
+            analyzer.close()
+        except Exception as e:
+            logger.error(f"关闭分析器时出错: {e}")
+    for pkg in deps_data["packages"]:
+        pkg["license"] = license_map.get(pkg["name"], "")
+
     markdown = readme_generator.generate_dependency_readme(deps_data, fetcher=fetcher)
 
     # 输出

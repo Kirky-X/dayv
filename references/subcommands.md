@@ -9,6 +9,7 @@
 | [subcommands-features.md](./subcommands-features.md) | Core Features 1-13 详细说明（依赖图/冲突检测/漏洞扫描/健康度/可视化/...） |
 | [subcommands-examples.md](./subcommands-examples.md) | 各子命令输出 schema 与示例（冲突/漏洞/report.json/health/SBOM） |
 | [subcommands-optimize.md](./subcommands-optimize.md) | optimize 子命令详解（去重/冗余/未使用检测） |
+| [external-tools-integration.md](./external-tools-integration.md) | 外部工具（osv-scanner/syft/cyclonedx-cli）能力对标、集成设计、SBOM diff 语义、工具注册表模式、引入决策清单（方案文档，当前未实施） |
 
 ## Quick Start
 
@@ -41,7 +42,8 @@ python scripts/dependency_analyzer.py report deps_data.json --format json -o rep
 python scripts/dependency_analyzer.py report deps_data.json --format html -o report.html
 python scripts/dependency_analyzer.py report deps_data.json --format pdf  -o report.pdf
 python scripts/dependency_analyzer.py report deps_data.json --format sbom -o project-sbom.spdx.json
-  # deps_data.json schema: {"packages": [{name, version, ecosystem, is_root}], "edges": [{source, target, constraint}]}
+  # deps_data.json schema 见 subcommands-examples.md（version 会经 _extract_concrete_version
+  # 归一化：范围串取下界标 version_inferred，伪版本/通配置空并显式报告，不送 OSV）
   # --format json (默认): 与 export_report_json schema 一致的 JSON 报告
   # --format html: 含可排序表格的 HTML 报告（支持中文，防 XSS）
   # --format pdf:  HTML 转 PDF（依赖 weasyprint，未安装时显式报错）

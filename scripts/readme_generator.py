@@ -9,7 +9,9 @@ Readme Generator - 项目依赖 README 生成器
 - 按 ecosystem 分组（PyPI / npm / Maven ...），每组一个表格
 - 表格列: 包名 | 版本 | 用途 | 许可证
 - fetcher 注入: 测试时传 mock，CLI 调用时传 EcosystemFetcher（subprocess 调 ecosystem 脚本）
-- 未传 fetcher: 不查 registry，用途/许可证列显示占位符 "-"
+- 许可证列优先取 deps_data 的 license 键（enrich_licenses 回写图 DB 后的单一数据源）；
+  fetcher 查询仅补 description 与缺失的 license
+- 未传 fetcher: 不查 registry，用途列显示占位符 "-"（许可证列仍显示 deps_data 携带值）
 - 根包（is_root=True）不出现在依赖表格中
 """
 
@@ -85,9 +87,12 @@ class EcosystemFetcher:
         self, items: Iterable[Tuple[str, str]]
     ) -> Dict[Tuple[str, str], dict]:
         """
-        批量并发查询（ThreadPoolExecutor + 缓存命中短路）。
+        批量并发查询：按 ecosystem 分组，每组一次 `--batch` 子进程。
 
-        保留限流：MAX_WORKERS 上限 + 各 ecosystem 脚本内 RequestClient 的随机延迟。
+        单次子进程查 N 个包（脚本内部 4 线程并发），消除"一包一子进程"的
+        解释器启动开销（100 依赖 ≈ 40s → 每生态 1 个子进程）。--batch 整体
+        失败（超时/非零退出/响应不对齐）时该组回退逐包子进程的现路径；
+        单请求限流仍由各 ecosystem 脚本内 RequestClient 随机延迟负责。
         失败回退与 fetch() 一致（空 dict，不抛异常）。
 
         Args:
@@ -106,21 +111,84 @@ class EcosystemFetcher:
                 to_fetch.append(key)
 
         if to_fetch:
+            by_eco: Dict[str, List[str]] = {}
+            for name, eco in to_fetch:
+                by_eco.setdefault(eco, []).append(name)
+
+            def _fetch_group(eco: str, names: List[str]) -> Dict[Tuple[str, str], dict]:
+                try:
+                    batch = self._fetch_batch_uncached(eco, names)
+                    return {(n, eco): batch.get(n, {}) for n in names}
+                except Exception as e:
+                    logger.debug(f"--batch 批量查询 {eco} 失败，回退逐包子进程: {e}")
+                    with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as ex:
+                        infos = list(
+                            ex.map(lambda n: self._fetch_uncached(n, eco), names)
+                        )
+                    return {(n, eco): info for n, info in zip(names, infos)}
+
             with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as ex:
-                futures = {
-                    ex.submit(self._fetch_uncached, name, eco): (name, eco)
-                    for (name, eco) in to_fetch
-                }
+                futures = [
+                    ex.submit(_fetch_group, eco, names) for eco, names in by_eco.items()
+                ]
                 for fut in as_completed(futures):
-                    name, eco = futures[fut]
-                    try:
-                        info = fut.result()
-                    except Exception as e:  # 双保险：_fetch_uncached 已吞异常
-                        logger.debug(f"fetch_many 查询 {name}/{eco} 异常: {e}")
-                        info = {}
-                    self._cache[(name, eco)] = info
-                    results[(name, eco)] = info
+                    for key, info in fut.result().items():
+                        self._cache[key] = info
+                        results[key] = info
         return results
+
+    def _fetch_batch_uncached(
+        self, ecosystem: str, names: List[str]
+    ) -> Dict[str, dict]:
+        """单次子进程 `--batch` 查询同一 ecosystem 的 N 个包。
+
+        Args:
+            ecosystem: 生态系统（pypi/npm/maven/...）
+            names: 包参数列表（与脚本 CLI 单包参数同格式）
+
+        Returns:
+            {name: {"description", "license"}}（与 names 按位置对齐解析）
+
+        Raises:
+            Exception: 子进程超时/非零退出/响应非数组或与请求数不对齐时抛出，
+                       由调用方（fetch_many）回退逐包子进程路径
+        """
+        info_tuple = ECOSYSTEM_INFO.get(ecosystem)
+        if not info_tuple:
+            logger.debug(f"未知 ecosystem: {ecosystem}")
+            return {}
+
+        script_path = Path(__file__).parent / info_tuple[1]
+        if not script_path.exists():
+            logger.debug(f"脚本不存在: {script_path}")
+            return {}
+
+        # 批内串行/小并发受限流与重试影响，超时上限随包数线性放宽
+        timeout = FETCH_TIMEOUT * len(names)
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--batch", *names],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"batch 退出码 {result.returncode}: "
+                f"{result.stderr[:200] if result.stderr else 'no stderr'}"
+            )
+        data = json.loads(result.stdout)
+        if not isinstance(data, list) or len(data) != len(names):
+            raise ValueError("--batch 响应非数组或与请求数不对齐")
+        parsed: Dict[str, dict] = {}
+        for name, item in zip(names, data):
+            if isinstance(item, dict):
+                parsed[name] = {
+                    "description": item.get("description", ""),
+                    "license": item.get("license", ""),
+                }
+            else:
+                parsed[name] = {}
+        return parsed
 
     def _fetch_uncached(self, package_name: str, ecosystem: str) -> dict:
         info_tuple = ECOSYSTEM_INFO.get(ecosystem)
@@ -329,7 +397,9 @@ def generate_dependency_readme(
             version = pkg.get("version", "")
 
             description = PLACEHOLDER
-            license_info = PLACEHOLDER
+            # license 优先取 deps_data 携带值（enrich_licenses 回写图 DB 后的
+            # 单一数据源）；fetcher 查询仅作缺失时的回退，不再二次采集
+            license_info = pkg.get("license") or PLACEHOLDER
 
             if fetcher is not None:
                 try:
@@ -339,7 +409,7 @@ def generate_dependency_readme(
                         info = fetcher.fetch(name, eco)  # mock fetcher 回退路径
                     if info.get("description"):
                         description = info["description"]
-                    if info.get("license"):
+                    if not pkg.get("license") and info.get("license"):
                         license_info = info["license"]
                 except Exception as e:
                     logger.debug(f"fetcher 查询 {name} 失败: {e}")

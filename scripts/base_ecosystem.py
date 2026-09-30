@@ -31,6 +31,7 @@ BaseEcosystemAdapter — 7 ecosystem 包查询子脚本的共享基类。
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 
@@ -48,6 +49,9 @@ class BaseEcosystemAdapter:
     # PACKAGE_FORMAT_ERROR 非 None 时，main 会先调用 validate_package_arg；
     # 校验失败打印此错误并 sys.exit(1)
     PACKAGE_FORMAT_ERROR: str = ""
+    # --batch 模式内部并发上限（与 EcosystemFetcher.MAX_WORKERS 同级，
+    # 保留 registry 限流：单请求延迟仍由 RequestClient 随机延迟负责）
+    BATCH_WORKERS = 4
 
     def __init__(self, fetcher: Callable[[str], Any]):
         """
@@ -114,6 +118,37 @@ class BaseEcosystemAdapter:
         raw = self._fetcher(url)
         return self.parse_search_results(raw)
 
+    def run_batch(self, package_args: list) -> list:
+        """批量查询 N 个包（--batch 协议实现，供 main 调度）。
+
+        单次子进程查 N 个包，消除"一包一子进程"的启动开销
+        （100 依赖 ≈ 100 次 Python 解释器/导入启动 ≈ 40s）。内部
+        BATCH_WORKERS 线程并发，registry 限流语义与单包模式一致。
+
+        Args:
+            package_args: 包参数列表（每项与单包模式的 CLI 参数同格式，
+                          maven 为 "g:a"，packagist 为 "vendor/package"）
+
+        Returns:
+            与 package_args 等长对齐的结果数组；单个包失败/校验不通过
+            的位置为 {}（失败打到 stderr，不中断整批）
+        """
+        def _one(arg: str) -> dict:
+            try:
+                if self.PACKAGE_FORMAT_ERROR and not self.validate_package_arg(arg):
+                    print(
+                        f"Error: {self.PACKAGE_FORMAT_ERROR}: {arg}",
+                        file=sys.stderr,
+                    )
+                    return {}
+                return self.get_package(*self.split_package_arg(arg))
+            except Exception as e:
+                print(f"Error: 查询 {arg} 失败: {e}", file=sys.stderr)
+                return {}
+
+        with ThreadPoolExecutor(max_workers=self.BATCH_WORKERS) as ex:
+            return list(ex.map(_one, package_args))
+
     def main(self) -> None:
         """CLI 调度入口。各子脚本的 `main` 绑定到此方法。"""
         if len(sys.argv) < 2:
@@ -123,6 +158,9 @@ class BaseEcosystemAdapter:
             print(
                 f"  python {self.ECOSYSTEM_NAME}.py --search {self.SEARCH_USAGE_HINT}   # 搜索包"
             )
+            print(
+                f"  python {self.ECOSYSTEM_NAME}.py --batch {pkg_hint} ...  # 批量查询（JSON 数组输出，与参数等长对齐）"
+            )
             sys.exit(1)
 
         if sys.argv[1] == "--search":
@@ -130,6 +168,12 @@ class BaseEcosystemAdapter:
                 print("Error: 请提供搜索关键词")
                 sys.exit(1)
             result = self.search_packages(sys.argv[2])
+        elif sys.argv[1] == "--batch":
+            package_args = sys.argv[2:]
+            if not package_args:
+                print("Error: --batch 需要至少一个包参数")
+                sys.exit(1)
+            result = self.run_batch(package_args)
         else:
             arg = sys.argv[1]
             if self.PACKAGE_FORMAT_ERROR and not self.validate_package_arg(arg):
