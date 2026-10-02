@@ -157,7 +157,42 @@ class TestParsersProduceNoFakeVersions(unittest.TestCase):
 
 
 class TestOsvQueryUsesResolvedVersions(unittest.TestCase):
-    """OSV 查询行为：下界真实提交、无版本包跳过且显式报告。"""
+    """OSV 查询行为：下界真实提交、无版本包跳过且显式报告。
+
+    注：R5 后 OSV 查询为 purl-only 契约（版本嵌入 purl @version 段，
+    curl 实测 name+purl 并存会被 OSV 拒绝），断言从 purl 解码名与版本。
+    """
+
+    @staticmethod
+    def _query_names(http):
+        from urllib.parse import unquote
+
+        names = []
+        for call in http.calls:
+            for q in call["queries"]:
+                pkg = q["package"]
+                if "purl" in pkg:
+                    segs = [s for s in pkg["purl"][4:].split("/") if s]
+                    last = segs[-1]
+                    names.append(unquote(last.rsplit("@", 1)[0]))
+                else:
+                    names.append(pkg["name"])
+        return names
+
+    @staticmethod
+    def _query_versions(http):
+        from urllib.parse import unquote
+
+        versions = []
+        for call in http.calls:
+            for q in call["queries"]:
+                if "version" in q:
+                    versions.append(q["version"])
+                else:
+                    purl = q["package"].get("purl", "")
+                    if "@" in purl:
+                        versions.append(unquote(purl.rsplit("@", 1)[1]))
+        return versions
 
     def _build(self, dependencies: dict):
         path = write_package_json(
@@ -177,9 +212,7 @@ class TestOsvQueryUsesResolvedVersions(unittest.TestCase):
 
     def test_inferred_lower_bound_is_actually_sent_to_osv(self):
         _, http = self._build({"lodash": "^4.17.21"})
-        sent_versions = [
-            q["version"] for call in http.calls for q in call["queries"]
-        ]
+        sent_versions = self._query_versions(http)
         self.assertIn(
             "4.17.21",
             sent_versions,
@@ -192,9 +225,7 @@ class TestOsvQueryUsesResolvedVersions(unittest.TestCase):
     def test_unresolvable_versions_skipped_and_reported_in_scan_warnings(self):
         analyzer, http = self._build({"left-pad": "*", "lodash": "^4.17.21"})
         # 无确定版本的包根本不应产生 OSV 查询
-        sent_names = [
-            q["package"]["name"] for call in http.calls for q in call["queries"]
-        ]
+        sent_names = self._query_names(http)
         self.assertNotIn("left-pad", sent_names, "* 通配包应跳过 OSV 查询")
         self.assertIn("lodash", sent_names)
 

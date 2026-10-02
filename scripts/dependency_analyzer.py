@@ -226,19 +226,21 @@ def _classify_osv_packages(
 def _osv_query_for(pkg: DependencyNode) -> Dict[str, Any]:
     """构造单个包的 OSV querybatch 查询项。
 
-    package.purl 由 purl 单点模块构造（osv-scanner 同款标识，提升
-    maven/nuget 等歧义名匹配）；构造失败时仅省略 purl 字段，不影响
-    ecosystem+name+version 的既有匹配路径。
+    OSV 实测契约（本会话 curl 验证）：purl 查询必须 purl-only——与 name/
+    ecosystem 并存报 "name specified in a PURL query"，与顶层 version 并存报
+    "version specified in params and PURL query"，版本嵌入 purl 的 @version 段。
+    purl 构造失败时回退 ecosystem+name+version 既有路径。
     """
-    package: Dict[str, Any] = {
-        "ecosystem": OSV_ECOSYSTEM_MAP[pkg.ecosystem],
-        "name": pkg.name,
-    }
     purl_str = purl_mod.make_purl(pkg.name, pkg.ecosystem, pkg.version or None)
     if purl_str:
-        package["purl"] = purl_str
+        return {"package": {"purl": purl_str}}
+    osv_name = eco_reg.osv_ecosystem(pkg.ecosystem)
+    if not osv_name:
+        # 生态不可查询：返回空项（正常路径 _classify_osv_packages 已把
+        # 未映射生态显性分桶跳过，此处只做直接调用的防御）
+        return {}
     return {
-        "package": package,
+        "package": {"ecosystem": osv_name, "name": pkg.name},
         "version": pkg.version,
     }
 
@@ -872,6 +874,9 @@ class DependencyAnalyzer:
         # ignored_vulnerabilities 保存最近一次过滤结果供报告显性列出
         self.exemptions: List[Any] = []
         self.ignored_vulnerabilities: List[Dict[str, str]] = []
+        # manifest 解析期间的显性降级说明（R13：parser 挂在根节点 properties，
+        # build_dependency_graph 收集，generate_report 转入 scan_warnings）
+        self.manifest_notes: List[str] = []
         # OSV 漏洞扫描状态：未扫描时显式标注，禁止静默谎报"无漏洞"
         self.osv_scan_status: Dict[str, Any] = {
             "scanned": False,
@@ -1069,6 +1074,13 @@ class DependencyAnalyzer:
             f"正在构建依赖图: {len(packages)} 个包, {len(dependencies)} 个依赖关系"
         )
 
+        # 收集 parser 挂在节点上的显性降级说明（如 requirements.txt 无传递依赖）
+        self.manifest_notes = [
+            note
+            for pkg in packages
+            for note in (pkg.properties.get("manifest_notes") or [])
+        ]
+
         # 添加所有包节点
         for pkg in packages:
             self.db.add_package(pkg)
@@ -1092,42 +1104,36 @@ class DependencyAnalyzer:
         """
         logger.info("检测依赖冲突...")
         conflicts = []
+        seen_conflict_pkgs: set = set()
 
-        # 查询所有包 - 使用参数化查询
-        result = self.db.conn.execute("MATCH (p:Package) RETURN p.name, p.version")
-        packages = {}
+        # 约束驱动（R13）：同包被多个不同约束指向即冲突。
+        # 节点按主键去重后"同名多版本"不再出现，边约束是唯一可靠信号
+        result = self.db.conn.execute("""
+            MATCH (src:Package)-[d:DependsOn]->(dep:Package)
+            RETURN dep.name, d.constraint, src.name
+        """)
+        constraints: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
         while result.has_next():
-            row = result.get_next()
-            pkg_name = row[0]
-            if pkg_name not in packages:
-                packages[pkg_name] = []
-            packages[pkg_name].append(row[1])
+            target, constraint, source = result.get_next()
+            if source not in constraints[target][constraint]:
+                constraints[target][constraint].append(source)
 
-        # 检查每个包是否有版本冲突
-        for pkg_name, versions in packages.items():
-            if len(versions) > 1:
-                # 查询谁依赖这些版本
-                dependents = self.db.query_dependents(pkg_name)
-
-                # 检查约束是否冲突
-                constraints = defaultdict(list)
-                for dep in dependents:
-                    constraints[dep["constraint"]].append(dep["source"])
-
-                # 如果有多个不同的约束，可能冲突
-                if len(constraints) > 1:
-                    conflict = ConflictInfo(
+        for pkg_name, cmap in constraints.items():
+            if len(cmap) > 1:
+                seen_conflict_pkgs.add(pkg_name)
+                conflicts.append(
+                    ConflictInfo(
                         package=pkg_name,
                         required_by=[
-                            {"package": pkg, "constraint": c}
-                            for c, pkgs in constraints.items()
-                            for pkg in pkgs
+                            {"package": src, "constraint": c}
+                            for c, sources in cmap.items()
+                            for src in sources
                         ],
                         conflict_type="version_mismatch",
                         severity=SeverityLevel.HIGH,
                         suggestion=f"统一 {pkg_name} 的版本约束",
                     )
-                    conflicts.append(conflict)
+                )
 
         logger.info(f"发现 {len(conflicts)} 个冲突")
         return conflicts
@@ -1383,6 +1389,8 @@ class DependencyAnalyzer:
                 f"离线匹配保守跳过 {len(complex_ranges)} 个含复杂受影响区间的包"
                 f"（last_affected/limit 等，可能漏报）：{complex_ranges}"
             )
+        # manifest 解析期间的显性降级说明（R13）
+        scan_warnings.extend(self.manifest_notes)
         inferred_count = (status or {}).get("inferred_count", 0)
         if inferred_count:
             scan_warnings.append(
@@ -1824,17 +1832,96 @@ def parse_package_json(
     return packages, edges
 
 
+# ============ requirements.txt 解析（R13：根节点 + edges + marker 求值） ============
+
+# marker 求值支持的环境标识（PEP 508 常用子集）；未收录标识保守包含并告警
+_MARKER_ENV_KEYS = (
+    "python_version",
+    "python_full_version",
+    "sys_platform",
+    "platform_system",
+    "platform_python_implementation",
+    "implementation_name",
+    "extra",
+)
+
+
+def _marker_env_value(key: str) -> str:
+    import platform as _platform
+
+    if key == "python_version":
+        return ".".join(_platform.python_version_tuple()[:2])
+    if key == "python_full_version":
+        return _platform.python_version()
+    if key == "sys_platform":
+        return _platform.system().lower()
+    if key == "platform_system":
+        return _platform.system()
+    if key == "platform_python_implementation":
+        return _platform.python_implementation()
+    if key == "implementation_name":
+        return _platform.python_implementation().lower()
+    if key == "extra":
+        return ""  # 顶层安装无 extra
+    raise KeyError(key)
+
+
+def _eval_marker_clause(clause: str) -> bool:
+    m = re.match(
+        r"^([A-Za-z_][A-Za-z0-9_.]*)\s*(!=|==|>=|<=|>|<)\s*[\'\"]([^\'\"]*)[\'\"]$",
+        clause.strip(),
+    )
+    if not m:
+        raise ValueError(f"无法解析 marker 子句: {clause!r}")
+    key, op, expected = m.group(1), m.group(2), m.group(3)
+    actual = _marker_env_value(key)
+    if op == "==":
+        return actual == expected
+    if op == "!=":
+        return actual != expected
+    if op == ">=":
+        return compare_versions(actual, expected) >= 0
+    if op == "<=":
+        return compare_versions(actual, expected) <= 0
+    if op == ">":
+        return compare_versions(actual, expected) > 0
+    return compare_versions(actual, expected) < 0
+
+
+def _eval_marker(expr: str) -> tuple[bool, bool]:
+    """求值 PEP 508 marker 子集（and/or，单层）。
+
+    Returns:
+        (include, known)：marker 含未收录标识时 include=True（保守包含）
+        且 known=False（调用方告警）。
+    """
+    parts = re.split(r"\s+or\s+", expr.strip(), flags=re.IGNORECASE)
+    known = True
+    branch_results = []
+    for part in parts:
+        clause_results = []
+        for clause in re.split(r"\s+and\s+", part.strip(), flags=re.IGNORECASE):
+            try:
+                clause_result = _eval_marker_clause(clause)
+            except (KeyError, ValueError):
+                known = False
+                clause_result = True  # 未知标识：保守包含该子句
+            clause_results.append(clause_result)
+        branch_results.append(all(clause_results))
+    return any(branch_results), known
+
+
 def parse_requirements_txt(
     project_path: str,
 ) -> tuple[List[DependencyNode], List[DependencyEdge]]:
-    """
-    解析 requirements.txt 文件，提取依赖信息
+    """解析 requirements.txt（R13 升级版）。
 
-    Args:
-        project_path: requirements.txt 文件路径
-
-    Returns:
-        (packages, edges) 元组
+    - 根节点：同目录 pyproject.toml 的 project.name，缺省用目录名
+    - 每条声明产出 root→dep 约束边（多文件/约束文件交叉约束可检出冲突）；
+      精确 pin（==）标 version_resolved=True
+    - -r/--requirement 递归合并（防环），-c/--constraint 追加约束边，
+      其他 - 选项跳过并计数，`; marker` 做 PEP 508 子集求值（extra 视为未激活）
+    - 显性降级说明挂在根节点 manifest_notes（→ 报告 scan_warnings）
     """
     path_obj = Path(project_path)
     if not path_obj.exists():
@@ -1842,41 +1929,173 @@ def parse_requirements_txt(
         sys.exit(EXIT_INPUT_ERROR)
 
     try:
-        with path_obj.open("r", encoding="utf-8") as f:
-            lines = f.readlines()
+        lines = path_obj.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception as e:
         logger.error(f"读取文件失败: {e}")
         sys.exit(EXIT_INPUT_ERROR)
 
-    project_name = "unknown"
-    packages = []
-    edges = []
+    # 根节点：优先同目录 pyproject.toml 的项目名
+    root_name = "unknown"
+    manifest = path_obj.parent / "pyproject.toml"
+    if manifest.is_file():
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore
+        try:
+            with manifest.open("rb") as f:
+                pyproject = tomllib.load(f)
+            root_name = (pyproject.get("project") or {}).get("name") or root_name
+        except Exception as e:
+            logger.warning(f"解析 pyproject.toml 项目名失败（用目录名兜底）: {e}")
+    if root_name == "unknown":
+        root_name = path_obj.parent.name or "requirements-root"
 
-    for line in lines:
-        line = line.strip()
+    notes: List[str] = [
+        "requirements.txt 为平铺直接依赖清单，不含传递依赖关系；"
+        "冲突检测仅覆盖跨文件/约束文件的直接声明交叉，'零冲突'不等于全图无冲突"
+    ]
 
-        # 跳过注释和空行
-        if not line or line.startswith("#") or line.startswith("-"):
-            continue
+    packages: List[DependencyNode] = [
+        DependencyNode(
+            name=root_name,
+            # requirements.txt 无项目版本：留空（诚实未知），不编造版本号
+            version="",
+            ecosystem="pypi",
+            is_root=True,
+            properties={"manifest_notes": notes},
+        )
+    ]
+    edges: List[DependencyEdge] = []
+    declared: Dict[str, DependencyNode] = {}
+    # -c 约束双向生效：约束先于声明出现（文件头 -c）时在声明处补挂约束边
+    pending_constraints: Dict[str, List[str]] = defaultdict(list)
+    visited_files: set = set()
+    skipped_options = 0
 
-        # 解析包名和版本
-        match = re.match(r"([a-zA-Z0-9_-]+)\s*(.*)?", line)
-        if match:
-            pkg_name = match.group(1).lower()
-            constraint = match.group(2).strip() if match.group(2) else "*"
+    def _process_file(file_path: Path) -> None:
+        nonlocal skipped_options
+        key = str(file_path.resolve())
+        if key in visited_files:
+            return
+        visited_files.add(key)
+        try:
+            file_lines = file_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        except Exception as e:
+            logger.warning(f"读取被引用文件失败（跳过）: {file_path}: {e}")
+            return
+        for raw in file_lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # 行尾注释（保留 marker 中的引号内容不受影响：# 前必有空白）
+            hash_m = re.search(r"\s#(?![\'\"])", line)
+            if hash_m and " #" in line:
+                line = line[: hash_m.start()].strip()
+                if not line:
+                    continue
+            # -r/--requirement：递归合并
+            inc = re.match(r"^(?:-r|--requirement)\s+(.+)$", line)
+            if inc:
+                _process_file((file_path.parent / inc.group(1).strip().strip("\"'")).resolve())
+                continue
+            # -c/--constraint：约束应用到已声明包（追加约束边，可触发冲突检测）
+            con = re.match(r"^(?:-c|--constraint)\s+(.+)$", line)
+            if con:
+                con_path = file_path.parent / con.group(1).strip().strip("\"'")
+                if not con_path.is_file():
+                    logger.warning(f"约束文件不存在（跳过）: {con_path}")
+                    continue
+                for con_line in con_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    con_line = con_line.strip()
+                    if not con_line or con_line.startswith(("#", "-")):
+                        continue
+                    cm = re.match(r"([A-Za-z0-9_.-]+)\s*(.*)", con_line)
+                    if not cm:
+                        continue
+                    cname = cm.group(1).lower()
+                    cconstraint = cm.group(2).strip() or "*"
+                    if cname in declared:
+                        edges.append(
+                            DependencyEdge(
+                                source=root_name, target=cname, constraint=cconstraint
+                            )
+                        )
+                    else:
+                        pending_constraints[cname].append(cconstraint)
+                        logger.info(
+                            f"约束 {cname}{cconstraint} 暂未命中声明依赖（pip 语义：仅作用于已声明包，声明出现时补挂）"
+                        )
+                continue
+            # 其他 - 选项：跳过并计数
+            if line.startswith("-"):
+                skipped_options += 1
+                continue
+            # marker 求值（`;` 后为 marker）
+            if ";" in line:
+                dep_part, marker_part = line.split(";", 1)
+                dep_part = dep_part.strip()
+                try:
+                    include, known = _eval_marker(marker_part)
+                except Exception:
+                    include, known = True, False
+                if not known:
+                    logger.warning(f"marker 含未收录标识，保守包含: {line}")
+                if not include:
+                    logger.info(f"marker 条件不满足，跳过: {line}")
+                    continue
+            else:
+                dep_part = line
+            # URL/本地路径依赖（pkg @ ... / git+... / -e）取名字，约束记 *
+            at_url = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?\s*@\s*", dep_part)
+            if at_url:
+                pkg_name = at_url.group(1).lower()
+                constraint = dep_part[at_url.end():].strip()
+            else:
+                nm = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?\s*(.*)$", dep_part)
+                if not nm:
+                    logger.warning(f"无法解析依赖行（跳过）: {line}")
+                    continue
+                pkg_name = nm.group(1).lower()
+                constraint = nm.group(2).strip() or "*"
 
-            # 提取确定版本（下界）；无法确定时留空，禁止编造版本送 OSV
             resolved = _extract_concrete_version(constraint)
             version = resolved[0] if resolved else ""
+            exact_pin = bool(resolved) and not resolved[1]
 
-            packages.append(
-                DependencyNode(
-                    name=pkg_name,
-                    version=version,
-                    ecosystem="pypi",
-                    version_inferred=resolved[1] if resolved else False,
+            if pkg_name in declared:
+                # 同名多声明：节点保留首见（Package 主键），约束边逐条追加
+                # ——多约束会在 detect_conflicts 中显性检出
+                edges.append(
+                    DependencyEdge(source=root_name, target=pkg_name, constraint=constraint)
                 )
+                continue
+
+            node = DependencyNode(
+                name=pkg_name,
+                version=version,
+                ecosystem="pypi",
+                version_inferred=bool(resolved) and resolved[1],
+                version_resolved=exact_pin,
             )
+            declared[pkg_name] = node
+            packages.append(node)
+            edges.append(
+                DependencyEdge(source=root_name, target=pkg_name, constraint=constraint)
+            )
+            for earlier in pending_constraints.pop(pkg_name, []):
+                edges.append(
+                    DependencyEdge(
+                        source=root_name, target=pkg_name, constraint=earlier
+                    )
+                )
+
+    _process_file(path_obj)
+
+    if skipped_options:
+        logger.info(f"requirements 跳过 {skipped_options} 条 pip 选项行（-e/-i 等）")
 
     return packages, edges
 
@@ -2389,7 +2608,8 @@ def parse_composer_lock(project_path: str):
     packages = [
         DependencyNode(
             name=root_name,
-            version="0.0.0",
+            # composer.json 未提供版本：留空（诚实未知）
+            version="",
             ecosystem="packagist",
             is_root=True,
         )
@@ -2451,7 +2671,7 @@ def parse_gemfile_lock(project_path: str):
     root_name = path_obj.parent.name or "unknown"
     packages = [
         DependencyNode(
-            name=root_name, version="0.0.0", ecosystem="rubygems", is_root=True
+            name=root_name, version="", ecosystem="rubygems", is_root=True
         )
     ]
     edges: List[DependencyEdge] = []

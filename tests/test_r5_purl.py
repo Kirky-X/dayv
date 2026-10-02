@@ -93,16 +93,25 @@ class TestSbomExternalRefs:
 
 
 class TestOsvQueryPurl:
-    def test_query_includes_purl(self):
+    """OSV 实测契约：purl 查询必须 purl-only（name/ecosystem/顶层 version
+    与 purl 并存会被 OSV 以 InvalidArgument 拒绝），版本嵌入 purl @ 段。"""
+
+    def test_query_purl_only_with_version(self):
         q = da._osv_query_for(
             DependencyNode(name="requests", version="2.31.0", ecosystem="pypi")
         )
-        assert q["package"]["purl"] == "pkg:pypi/requests@2.31.0"
-        assert q["package"]["ecosystem"] == "PyPI"
-        assert q["version"] == "2.31.0"
+        assert q == {"package": {"purl": "pkg:pypi/requests@2.31.0"}}
 
-    def test_query_without_version_omits_purl_version(self):
+    def test_query_purl_only_without_version(self):
         q = da._osv_query_for(
             DependencyNode(name="lodash", version="", ecosystem="npm")
         )
-        assert q["package"]["purl"] == "pkg:npm/lodash"
+        assert q == {"package": {"purl": "pkg:npm/lodash"}}
+
+    def test_unmappable_ecosystem_defensive_empty(self):
+        # 正常路径未映射生态在 _classify_osv_packages 已分桶跳过；
+        # 直接调用返回空项防御（不抛 KeyError）
+        q = da._osv_query_for(
+            DependencyNode(name="x", version="1.0.0", ecosystem="golang")
+        )
+        assert q == {}
