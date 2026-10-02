@@ -1,0 +1,25 @@
+{
+  "skill": "dayv",
+  "queries": [
+    {"q": "分析一下这个项目的依赖树，看有没有版本冲突", "expect": "trigger"},
+    {"q": "扫一遍依赖有没有已知安全漏洞", "expect": "trigger"},
+    {"q": "帮我生成这个项目的 SBOM", "expect": "trigger"},
+    {"q": "package.json 里这些依赖哪些已经没用到了", "expect": "trigger"},
+    {"q": "pyproject.toml 的依赖版本冲突帮我解一下", "expect": "trigger"},
+    {"q": "这个仓库的依赖健康度怎么样，有没有无人维护的包", "expect": "trigger"},
+    {"q": "把 Cargo.toml 里重复的依赖清理优化一下", "expect": "trigger"},
+    {"q": "帮我看下依赖 react 升级到 19 会不会有兼容性问题", "expect": "trigger"},
+    {"q": "项目装依赖太慢了，帮我优化依赖配置去去重", "expect": "trigger"},
+    {"q": "帮我扫依赖漏洞，结果输出成 SARIF 给 CI 用", "expect": "trigger"},
+    {"q": "用 semgrep 扫一遍这个仓库的安全漏洞", "expect": "no", "owner": "tiangang"},
+    {"q": "扫描这个项目的 SQL 注入和硬编码密钥", "expect": "no", "owner": "tiangang"},
+    {"q": "发布前做一次安全审查，漏洞清单发我", "expect": "no", "owner": "tiangang"},
+    {"q": "代码库整体健康度怎么样？把所有检查都跑一遍", "expect": "no", "owner": "diting"},
+    {"q": "帮我 review 这个 PR 的代码质量", "expect": "no", "owner": "diting"},
+    {"q": "新项目初始化，把 pre-commit、CI 和覆盖率门禁都配上", "expect": "no", "owner": "pangu"},
+    {"q": "优化这个热点函数的执行性能", "expect": "no", "owner": "ouyezi"},
+    {"q": "帮我把这次依赖升级方案整理成一页文档", "expect": "no", "owner": "cangjie"},
+    {"q": "跑项目报 ModuleNotFoundError，帮我修一下", "expect": "no", "owner": "none"},
+    {"q": "把这个 monorepo 的公共代码抽成内部共享包", "expect": "no", "owner": "none"}
+  ]
+}
