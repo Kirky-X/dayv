@@ -38,3 +38,6 @@ test-prompts.json
 # Specmark/openspec 临时产物
 openspec/
 results.tsv
+
+# 运行时产物（分析器默认输出，误提交防护）
+dependency_report.*
