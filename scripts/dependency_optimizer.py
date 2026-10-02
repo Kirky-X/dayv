@@ -17,6 +17,8 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from utils import sort_versions
+
 
 # 各 ecosystem 的 import 扫描正则 + 文件扩展名 + 归一化函数
 ECOSYSTEM_SCAN: Dict[str, Dict[str, Any]] = {
@@ -166,7 +168,7 @@ def find_duplicates(deps_data: dict) -> List[Dict[str, Any]]:
                     ],
                     "suggestion": (
                         f"统一 {name} 版本声明，仅保留一个（当前 {len(entries)} 条；"
-                        f"建议保留最新稳定版 {max(versions) if versions else '未知'}）"
+                        f"建议保留最新稳定版 {sort_versions(versions)[0] if versions else '未知'}）"
                     ),
                 }
             )

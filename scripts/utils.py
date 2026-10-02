@@ -6,6 +6,7 @@ Dependency Skill - 共享工具模块
 
 import logging
 import random
+import re
 import sys
 import time
 from functools import lru_cache
@@ -242,6 +243,24 @@ def safe_get(data: dict, *keys, default: str = "") -> str:
     return result if result is not None else default
 
 
+# 1-2 段纯数字版本（"9.9"、"10"）：semver 严格要求三段，直接 parse 会失败并
+# 跌回字符串比较（"9.9" > "10.0"），补零归一到三段后再比较
+_PARTIAL_NUMERIC_RE = re.compile(r"^(\d+)(?:\.(\d+))?$")
+# npm 通配段：1.2.x / 1.x / 1.2.* / 单独 * 或 x
+_WILDCARD_RE = re.compile(r"^(\d+(?:\.\d+)*)\.(?:x|X|\*)$")
+_ANY_VERSION_RE = re.compile(r"^(?:\*|x|X)$")
+# npm hyphen 区间：A - B（两侧必须有空格），任意一侧可为 1-2 段缺段版本
+_HYPHEN_SPLIT_RE = re.compile(r"\s-\s")
+
+
+def _pad_semver(version: str) -> str:
+    """把 1-2 段纯数字版本补齐为三段（"9.9" → "9.9.0"），其余原样返回。"""
+    m = _PARTIAL_NUMERIC_RE.match(version)
+    if not m:
+        return version
+    return f"{m.group(1)}.{m.group(2) or '0'}.0"
+
+
 def compare_versions(v1: str, v2: str) -> int:
     """
     比较两个语义化版本号
@@ -256,9 +275,9 @@ def compare_versions(v1: str, v2: str) -> int:
          1: v1 > v2
     """
     try:
-        # 清理版本号（移除前缀如 v, =, ^, ~ 等）
-        clean_v1 = clean_version_string(v1)
-        clean_v2 = clean_version_string(v2)
+        # 清理版本号（移除前缀如 v, =, ^, ~ 等），1-2 段补零归一
+        clean_v1 = _pad_semver(clean_version_string(v1))
+        clean_v2 = _pad_semver(clean_version_string(v2))
 
         ver1 = semver.Version.parse(clean_v1)
         ver2 = semver.Version.parse(clean_v2)
@@ -329,7 +348,7 @@ def sort_versions(versions: List[str], reverse: bool = True) -> List[str]:
 
     def version_key(v):
         try:
-            clean_v = clean_version_string(v)
+            clean_v = _pad_semver(clean_version_string(v))
             ver = semver.Version.parse(clean_v)
             return (
                 ver.major,
@@ -363,10 +382,31 @@ def check_version_constraint(version: str, constraint: str) -> bool:
         # 解析约束
         constraint = constraint.strip()
 
+        # npm 通配：单独 * / x 匹配任意版本
+        if _ANY_VERSION_RE.match(constraint):
+            return True
+
         # 处理复合约束 (逗号分隔)
         if "," in constraint:
             sub_constraints = [c.strip() for c in constraint.split(",")]
             return all(check_version_constraint(version, c) for c in sub_constraints)
+
+        # npm hyphen 区间 "A - B"：下界含（缺段补 0）、上界按 npm 缺段语义
+        # （"2.3" → < 2.4.0；"2" → < 3.0.0；完整三段 → <= 上界）
+        if _HYPHEN_SPLIT_RE.search(constraint):
+            left, right = _HYPHEN_SPLIT_RE.split(constraint, maxsplit=1)
+            lower = semver.Version.parse(_pad_semver(clean_version_string(left.strip())))
+            right_clean = clean_version_string(right.strip())
+            segs = right_clean.split(".")
+            if len(segs) == 1:
+                return ver >= lower and ver < semver.Version.parse(
+                    f"{int(segs[0]) + 1}.0.0"
+                )
+            if len(segs) == 2:
+                return ver >= lower and ver < semver.Version.parse(
+                    f"{segs[0]}.{int(segs[1]) + 1}.0"
+                )
+            return ver >= lower and ver <= semver.Version.parse(_pad_semver(right_clean))
 
         # 精确匹配
         if constraint.startswith("=") and not constraint.startswith("=="):
@@ -419,6 +459,14 @@ def check_version_constraint(version: str, constraint: str) -> bool:
                 and ver.minor == target_ver.minor
                 and ver >= target_ver
             )
+
+        # npm 通配后缀：1.2.x / 1.x / 1.2.*（按数字前缀逐段匹配）
+        elif _WILDCARD_RE.match(constraint):
+            prefix_segs = [
+                int(s) for s in _WILDCARD_RE.match(constraint).group(1).split(".")
+            ]
+            ver_segs = [ver.major, ver.minor, ver.patch]
+            return all(v == p for v, p in zip(ver_segs, prefix_segs))
 
         # 精确匹配（无前缀）
         else:

@@ -2274,6 +2274,23 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def _security_deps_data(
+    package_name: str, version: str, ecosystem: str
+) -> Dict[str, Any]:
+    """构造 security 子命令的 deps_data（被检包视为根依赖，ecosystem 随 -e 参数）。"""
+    return {
+        "packages": [
+            {
+                "name": package_name,
+                "version": version,
+                "is_root": True,
+                "ecosystem": ecosystem,
+            }
+        ],
+        "edges": [],
+    }
+
+
 def cmd_security(args):
     """检查安全漏洞"""
     package_name = args.package
@@ -2355,18 +2372,8 @@ def cmd_security(args):
                     }
                     for v in vulns
                 ]
-                # 单包 security 查询：被检查的包本身视为根依赖
-                deps_data = {
-                    "packages": [
-                        {
-                            "name": package_name,
-                            "version": latest_version,
-                            "is_root": True,
-                            "ecosystem": "pypi",
-                        }
-                    ],
-                    "edges": [],
-                }
+                # 单包 security 查询：被检查的包本身视为根依赖（ecosystem 随 -e）
+                deps_data = _security_deps_data(package_name, latest_version, ecosystem)
                 prioritized = vulnerability_prioritizer.prioritize_vulnerabilities(
                     vuln_dicts, deps_data
                 )
