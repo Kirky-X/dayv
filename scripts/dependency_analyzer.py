@@ -1803,10 +1803,22 @@ def parse_package_json(
 
     edges = []
 
-    # 合并 dependencies 和 devDependencies
-    all_deps = {}
-    all_deps.update(data.get("dependencies", {}))
-    all_deps.update(data.get("devDependencies", {}))
+    # 按组采集（R11 规则引擎需要组语义）；同名包取高优先组
+    # （dependencies > optionalDependencies > peerDependencies > devDependencies）
+    all_deps: Dict[str, Any] = {}
+    groups: Dict[str, str] = {}
+    for group_key in (
+        "dependencies",
+        "optionalDependencies",
+        "peerDependencies",
+        "devDependencies",
+    ):
+        for dep_name, constraint in (data.get(group_key) or {}).items():
+            if dep_name not in all_deps:
+                all_deps[dep_name] = constraint
+                groups[dep_name] = (
+                    "dev" if group_key == "devDependencies" else group_key
+                )
 
     for pkg_name, version_constraint in all_deps.items():
         # 提取确定版本（下界）；无法确定（*/latest/x 通配、区间）时留空，
@@ -1820,12 +1832,16 @@ def parse_package_json(
                 version=version,
                 ecosystem="npm",
                 version_inferred=resolved[1] if resolved else False,
+                properties={"group": groups.get(pkg_name, "")},
             )
         )
 
         edges.append(
             DependencyEdge(
-                source=project_name, target=pkg_name, constraint=version_constraint
+                source=project_name,
+                target=pkg_name,
+                constraint=version_constraint,
+                properties={"group": groups.get(pkg_name, "")},
             )
         )
 
@@ -2549,6 +2565,7 @@ def _deps_data_to_graph(data: Dict[str, Any]) -> Tuple[List[DependencyNode], Lis
                 version_inferred=(resolved[1] if resolved else False)
                 and not version_resolved,
                 version_resolved=version_resolved,
+                properties={"group": str(pkg_data.get("group", "") or "")},
             )
         )
 
@@ -3257,6 +3274,83 @@ def cmd_analyze_data(args):
             if not conflicts and not vulns and not update_paths:
                 logger.info("依赖状态良好")
 
+        # 声明式规则引擎（R11）+ 违规基线（R12）：统一 violations 列表
+        rules_path = getattr(args, "rules", None)
+        baseline_path = getattr(args, "baseline", None)
+        ignore_known_path = getattr(args, "ignore_known", None)
+        rule_violations: List[Dict[str, Any]] = []
+        if rules_path:
+            import rule_engine
+
+            rules = rule_engine.load_rules(rules_path)
+            license_map = analyzer.db.get_license_map()
+            deprecated_map = {
+                d["package"]: True
+                for d in analyzer.db.query_deprecated_packages()
+            }
+            rule_violations = rule_engine.evaluate_rules(
+                rules,
+                _to_deps_data(packages, edges),
+                license_map=license_map,
+                deprecated_map=deprecated_map,
+            )
+            print()
+            print(rule_engine.format_violations(rule_violations))
+
+        if baseline_path or ignore_known_path:
+            import violation_baseline as vb
+
+            conflicts_now = analyzer.detect_conflicts()
+            vulns_now = analyzer.assess_security()
+            current = vb.violations_from_report(
+                {
+                    "conflicts": [
+                        {
+                            "package": c.package,
+                            "conflict_type": c.conflict_type,
+                            "severity": c.severity.value,
+                        }
+                        for c in conflicts_now
+                    ],
+                    "vulnerabilities": [
+                        {
+                            "package": v.package,
+                            "cve_id": v.cve_id,
+                            "severity": v.severity.value,
+                        }
+                        for v in vulns_now
+                    ],
+                    "rule_violations": rule_violations,
+                }
+            )
+            if baseline_path:
+                new_keys, vanished = vb.save_baseline(current, baseline_path)
+                print(f"\n📌 基线已写入 {baseline_path}（{len(new_keys)} 条已知违规）")
+                if vanished:
+                    print(
+                        f"⚠️ 基线非收缩变更：{len(vanished)} 条旧基线条目在新扫描中消失"
+                        "（可能已修复，请人工确认后保留或清理）:"
+                    )
+                    for k in vanished[:20]:
+                        print(f"   - {k}")
+            if ignore_known_path:
+                baseline_keys = vb.load_baseline(ignore_known_path)
+                new_items, known_items = vb.split_known(current, baseline_keys)
+                print(
+                    f"\n📌 基线对照: 新增 {len(new_items)} 条 / 已知 {len(known_items)} 条"
+                    "（--exit-code 判定只看新增）"
+                )
+                for v in known_items[:20]:
+                    print(f"   [已知] {vb.violation_key(v)}")
+                known_vuln_keys = {
+                    vb.violation_key(v) for v in known_items if "cve_id" in v
+                }
+                found_vulns = [
+                    v
+                    for v in found_vulns
+                    if f"{v.package}:vulnerability:{v.cve_id}" not in known_vuln_keys
+                ]
+
     finally:
         try:
             analyzer.close()
@@ -3377,6 +3471,7 @@ def _to_deps_data(packages: List[DependencyNode], edges: List[DependencyEdge]) -
                 "is_root": p.is_root,
                 "license": p.properties.get("license", ""),
                 "version_resolved": p.version_resolved,
+                "group": p.properties.get("group", ""),
             }
             for p in packages
         ],
@@ -4322,6 +4417,24 @@ def main():
         "--cache",
         action="store_true",
         help="OSV 查询结果缓存到 ~/.dayv/cache（TTL 24h；推断版本 ≤5min 防误报）",
+    )
+    analyze_parser.add_argument(
+        "--rules",
+        default=None,
+        metavar="FILE",
+        help="声明式规则文件 .dayv/rules.json（R11；违规并入统一 violations 列表）",
+    )
+    analyze_parser.add_argument(
+        "--baseline",
+        default=None,
+        metavar="FILE",
+        help="写已知违规基线（shrink-only 检查，消失条目显性提示）",
+    )
+    analyze_parser.add_argument(
+        "--ignore-known",
+        default=None,
+        metavar="FILE",
+        help="命中基线的违规单独列出，--exit-code 判定只看新增",
     )
 
     # analyze 命令（保留用于向后兼容）
