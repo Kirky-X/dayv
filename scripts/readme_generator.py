@@ -30,16 +30,13 @@ logger = logging.getLogger(__name__)
 
 PLACEHOLDER = "-"
 
-# Ecosystem → (中文名, 脚本名)
-# 顺序固定（PyPI 永远在 npm 前，便于人类阅读）
+# Ecosystem → (OSV/registry 显示名, 脚本名)——来自单一注册表 ecosystem_registry
+# （显示名沿用 OSV 生态名，顺序固定：PyPI 永远在 npm 前，便于人类阅读）
+import ecosystem_registry as _eco_reg
+
 ECOSYSTEM_INFO: Dict[str, tuple] = {
-    "pypi": ("PyPI", "pypi.py"),
-    "npm": ("npm", "npm.py"),
-    "maven": ("Maven", "maven.py"),
-    "crates": ("crates", "crates.py"),
-    "rubygems": ("RubyGems", "rubygems.py"),
-    "packagist": ("Packagist", "packagist.py"),
-    "nuget": ("NuGet", "nuget.py"),
+    eco: (_eco_reg.eco_meta(eco)["readme_name"], _eco_reg.script_for(eco))
+    for eco in _eco_reg.ecosystem_names()
 }
 
 # 默认 ecosystem 输出顺序（未在列表中的排最后）

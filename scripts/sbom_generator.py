@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+import ecosystem_registry as eco_reg
+
 logger = logging.getLogger(__name__)
 
 # ============ SPDX 2.3 常量 ============
@@ -24,17 +26,6 @@ SPDX_VERSION = "SPDX-2.3"
 SPDX_DATA_LICENSE = "CC0-1.0"
 SPDX_LICENSE_LIST_VERSION = "3.21"
 SPDX_DOC_ID = "SPDXRef-DOCUMENT"
-
-# Ecosystem → registry URL 前缀（downloadLocation 用）
-ECOSYSTEM_REGISTRY = {
-    "pypi": "https://pypi.org/project/",
-    "npm": "https://www.npmjs.com/package/",
-    "maven": "https://repo1.maven.org/maven2/",
-    "crates": "https://crates.io/crates/",
-    "rubygems": "https://rubygems.org/gems/",
-    "packagist": "https://packagist.org/packages/",
-    "nuget": "https://www.nuget.org/packages/",
-}
 
 # 默认 Supplier（无供应商信息时）
 DEFAULT_SUPPLIER = "NOASSERTION"
@@ -60,8 +51,8 @@ def _make_spdx_id(name: str) -> str:
 
 
 def _make_download_location(name: str, ecosystem: str) -> str:
-    """按 ecosystem 生成 downloadLocation URL"""
-    base = ECOSYSTEM_REGISTRY.get(ecosystem, "")
+    """按 ecosystem 生成 downloadLocation URL（基址来自 ecosystem_registry）"""
+    base = eco_reg.registry_base_url(ecosystem)
     if not base:
         return "NOASSERTION"
     return f"{base}{name}"

@@ -45,6 +45,7 @@ except ImportError:
     )
     _sys.exit(1)
 
+import ecosystem_registry as eco_reg
 from utils import (
     RequestClient,
     check_version_constraint,
@@ -70,15 +71,9 @@ MAX_RECOMMENDATIONS_DISPLAY = 20
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_BATCH_CHUNK = 250  # OSV querybatch 上限 1000，保守分片
 
-# 内部 ecosystem 标识 → OSV ecosystem 名（https://ossf.github.io/osv-schema/）
+# 内部 ecosystem 标识 → OSV ecosystem 名（单一来源：ecosystem_registry）
 OSV_ECOSYSTEM_MAP = {
-    "pypi": "PyPI",
-    "npm": "npm",
-    "maven": "Maven",
-    "crates": "crates.io",
-    "rubygems": "RubyGems",
-    "packagist": "Packagist",
-    "nuget": "NuGet",
+    eco: meta["osv_ecosystem"] for eco, meta in eco_reg.ECOSYSTEMS.items()
 }
 
 
@@ -1345,27 +1340,8 @@ def detect_dependency_file(project_path: str) -> Optional[str]:
     Returns:
         依赖文件路径，如果未找到返回 None
     """
-    # 依赖文件映射：文件名 -> 生态系统
-    # 注：Go 无中央 registry，按 Non-Goals 排除 go.mod
-    dependency_files = {
-        "pyproject.toml": "pypi",
-        "requirements.txt": "pypi",
-        "setup.py": "pypi",
-        "package.json": "npm",
-        "pom.xml": "maven",
-        "build.gradle": "maven",
-        "build.gradle.kts": "maven",
-        "Cargo.toml": "crates",
-        "Gemfile": "rubygems",
-        "composer.json": "packagist",
-    }
-
-    # 扩展名映射：扩展名 -> 生态系统（用于 .csproj/.fsproj/.vbproj 等）
-    dependency_extensions = {
-        ".csproj": "nuget",
-        ".fsproj": "nuget",
-        ".vbproj": "nuget",
-    }
+    # 文件 → 生态映射来自单一注册表（manifest + lockfile 全集）
+    dependency_files = eco_reg.detect_files()
 
     path_obj = Path(project_path)
 
@@ -1375,8 +1351,7 @@ def detect_dependency_file(project_path: str) -> Optional[str]:
         if filename in dependency_files:
             return str(path_obj)
         # 按扩展名匹配（如 MyApp.csproj）
-        suffix = path_obj.suffix.lower()
-        if suffix in dependency_extensions:
+        if eco_reg.extension_entry(path_obj.suffix):
             return str(path_obj)
         logger.warning(f"不支持的依赖文件格式 {filename}")
         return None
@@ -1392,15 +1367,33 @@ def detect_dependency_file(project_path: str) -> Optional[str]:
                 detected.append((ecosystem, filename, filepath))
         for filepath in sorted(path_obj.iterdir()):
             if filepath.is_file():
-                suffix = filepath.suffix.lower()
-                if suffix in dependency_extensions:
-                    detected.append(
-                        (dependency_extensions[suffix], filepath.name, filepath)
-                    )
+                ecosystem = eco_reg.extension_entry(filepath.suffix)
+                if ecosystem:
+                    detected.append((ecosystem, filepath.name, filepath))
 
         if detected:
             for eco, name, _ in detected:
                 logger.info(f"检测到 {eco} 项目: {name}")
+            # 同生态 lockfile 优先于 manifest（精确锁定版本 > 范围约束下界）；
+            # 被跳过的 manifest 显性列出（规则 12：静默缩小范围禁止）
+            lockfile_first = [
+                d for d in detected
+                if (eco_reg.file_entry(d[1]) or {}).get("kind") == "lockfile"
+            ]
+            if lockfile_first:
+                chosen = lockfile_first[0]
+                rest = [d for d in detected if d[1] != chosen[1]]
+                skipped_manifests = [
+                    name for _, name, _ in rest
+                    if (eco_reg.file_entry(name) or {}).get("kind") == "manifest"
+                    and (eco_reg.file_entry(name) or {}).get("ecosystem") == chosen[0]
+                ]
+                detected = [chosen] + rest
+                if skipped_manifests:
+                    logger.info(
+                        f"命中 lockfile {chosen[1]}，优先使用精确版本；"
+                        f"同生态 manifest 跳过: {', '.join(skipped_manifests)}"
+                    )
             distinct = {eco for eco, _, _ in detected}
             if len(distinct) > 1:
                 effective = detected[0][1]
@@ -1688,6 +1681,15 @@ def parse_requirements_txt(
     return packages, edges
 
 
+# parser 逻辑名 → 实现函数（文件清单与生态归属的单一来源在 ecosystem_registry，
+# 新增可解析文件 = 注册表加一条目 + 此处加一个函数引用）
+PARSER_FUNCS = {
+    "pyproject": parse_pyproject_toml,
+    "requirements": parse_requirements_txt,
+    "package_json": parse_package_json,
+}
+
+
 def parse_dependencies(
     project_path: str,
 ) -> tuple[List[DependencyNode], List[DependencyEdge], str]:
@@ -1705,62 +1707,51 @@ def parse_dependencies(
 
     if not dep_file:
         logger.error(f"在项目 {project_path} 中未找到支持的依赖文件")
-        logger.info("支持的依赖文件:")
-        logger.info("  Python: pyproject.toml, requirements.txt, setup.py")
-        logger.info("  Node.js: package.json")
-        logger.info("  Java: pom.xml, build.gradle")
-        logger.info("  Rust: Cargo.toml")
-        logger.info("  Ruby: Gemfile")
-        logger.info("  PHP: composer.json")
-        logger.info("  .NET: *.csproj, *.fsproj, *.vbproj")
+        logger.info("支持的依赖文件（来自 ecosystem_registry）:")
+        for eco, meta in eco_reg.ECOSYSTEMS.items():
+            files = [
+                name
+                for name, entry in eco_reg.DEPENDENCY_FILES.items()
+                if entry["ecosystem"] == eco
+            ]
+            logger.info(f"  {meta.get('display_name', eco)}({eco}): {', '.join(files)}")
         logger.info("注: Go 和 C/C++ 无中央 registry，不在支持列表")
         sys.exit(1)
 
     filename = Path(dep_file).name
 
-    # 根据文件名选择解析器
-    # 注：detect_dependency_file 可识别 Gemfile/composer.json/.csproj 等，
-    # 但 parsers 暂未实现自动解析。命中这些文件时下方会显式提示用户改用 query/search 子命令。
-    parsers = {
-        "pyproject.toml": (parse_pyproject_toml, "pypi"),
-        "package.json": (parse_package_json, "npm"),
-        "requirements.txt": (parse_requirements_txt, "pypi"),
-    }
+    # 文件 → (parser, ecosystem) 分派来自单一注册表
+    entry = eco_reg.file_entry(filename)
+    ext_eco = eco_reg.extension_entry(Path(filename).suffix)
+    if entry is None and ext_eco:
+        entry = {"ecosystem": ext_eco, "kind": "manifest", "parser": None}
 
-    if filename not in parsers:
-        # 检查是否是 detect 支持但 parser 未实现的文件
-        detect_supported_but_unparsed = {
-            "pom.xml": "maven",
-            "build.gradle": "maven",
-            "build.gradle.kts": "maven",
-            "Cargo.toml": "crates",
-            "Gemfile": "rubygems",
-            "composer.json": "packagist",
-        }
-        # 也检查 .csproj/.fsproj/.vbproj 扩展名
-        suffix = Path(filename).suffix.lower()
-        if suffix in (".csproj", ".fsproj", ".vbproj"):
-            ecosystem_hint = "nuget"
-        else:
-            ecosystem_hint = detect_supported_but_unparsed.get(filename)
-
-        if ecosystem_hint:
-            logger.warning(
-                f"已检测到 {filename}（ecosystem={ecosystem_hint}），"
-                f"但自动解析器暂未实现。"
-            )
-            logger.info(
-                f"请改用 query/search 子命令手动查询: "
-                f"python dependency_analyzer.py query <pkg> -e {ecosystem_hint}"
-            )
-        else:
-            logger.warning(f"暂不支持自动解析 {filename}")
-            logger.info(
-                "提示: 目前支持自动解析 pyproject.toml, package.json, requirements.txt"
-            )
+    if entry is None:
+        logger.warning(f"暂不支持自动解析 {filename}")
+        supported = [
+            name
+            for name, e in eco_reg.DEPENDENCY_FILES.items()
+            if e["parser"]
+        ]
+        logger.info(f"提示: 目前支持自动解析 {', '.join(supported)}")
         sys.exit(1)
 
-    parse_func, ecosystem = parsers[filename]
+    ecosystem = entry["ecosystem"]
+
+    if not entry["parser"] or entry["parser"] not in PARSER_FUNCS:
+        # 检测可识别但 parser 未实现（注册表声明与实现不一致同样走这里）：
+        # 显式提示替代方案，不静默失败
+        logger.warning(
+            f"已检测到 {filename}（ecosystem={ecosystem}，"
+            f"{entry['kind']}），但自动解析器暂未实现。"
+        )
+        logger.info(
+            f"请改用 query/search 子命令手动查询: "
+            f"python dependency_analyzer.py query <pkg> -e {ecosystem}"
+        )
+        sys.exit(1)
+
+    parse_func = PARSER_FUNCS[entry["parser"]]
 
     logger.info(f"解析依赖文件: {filename}")
     packages, edges = parse_func(dep_file)
@@ -2066,9 +2057,34 @@ def _to_deps_data(packages: List[DependencyNode], edges: List[DependencyEdge]) -
     }
 
 
+def cmd_list_parsers() -> None:
+    """打印各生态解析能力自省表（--list-parsers，来自 ecosystem_registry）。"""
+    print(f"{'生态':<12}{'状态':<18}{'manifest 解析':<34}lockfile 解析")
+    for row in eco_reg.parser_status():
+
+        def fmt(entries: List[Dict[str, Any]]) -> str:
+            parts = []
+            for e in entries:
+                parts.append(
+                    f"{e['file']}:{e['parser'] or '未实现'}"
+                )
+            return ", ".join(parts)
+
+        print(
+            f"{row['ecosystem']:<12}{row['status']:<18}{fmt(row['manifests']):<34}{fmt(row['lockfiles'])}"
+        )
+
+
 def cmd_analyze(args):
     """分析项目依赖"""
+    if getattr(args, "list_parsers", False):
+        cmd_list_parsers()
+        return
+
     project_path = args.project
+    if not project_path:
+        logger.error("analyze 需要项目路径或依赖文件路径（--list-parsers 可省略）")
+        sys.exit(1)
 
     logger.info(f"正在分析项目: {project_path}")
 
@@ -2203,18 +2219,8 @@ def cmd_query(args):
 
     logger.info(f"正在查询 {ecosystem} 包: {package_name}")
 
-    # 根据生态系统选择脚本
-    scripts = {
-        "pypi": "pypi.py",
-        "npm": "npm.py",
-        "maven": "maven.py",
-        "crates": "crates.py",
-        "rubygems": "rubygems.py",
-        "packagist": "packagist.py",
-        "nuget": "nuget.py",
-    }
-
-    script_name = scripts.get(ecosystem)
+    # 生态 → 子脚本入口来自单一注册表
+    script_name = eco_reg.script_for(ecosystem)
     if not script_name:
         logger.error(f"不支持的生态系统 {ecosystem}")
         sys.exit(1)
@@ -2242,17 +2248,8 @@ def cmd_search(args):
 
     logger.info(f"正在 {ecosystem} 中搜索: {keyword}")
 
-    scripts = {
-        "pypi": "pypi.py",
-        "npm": "npm.py",
-        "maven": "maven.py",
-        "crates": "crates.py",
-        "rubygems": "rubygems.py",
-        "packagist": "packagist.py",
-        "nuget": "nuget.py",
-    }
-
-    script_name = scripts.get(ecosystem)
+    # 生态 → 子脚本入口来自单一注册表
+    script_name = eco_reg.script_for(ecosystem)
     if not script_name:
         logger.error(f"不支持的生态系统 {ecosystem}")
         sys.exit(1)
@@ -2305,7 +2302,11 @@ def cmd_security(args):
         import json as _json
         import subprocess as _sp
 
-        script_path = Path(__file__).parent / f"{ecosystem}.py"
+        script_name = eco_reg.script_for(ecosystem)
+        if not script_name:
+            print(f"\n❌ 不支持 ecosystem={ecosystem}（注册表无对应查询脚本）")
+            return
+        script_path = Path(__file__).parent / script_name
         if not script_path.exists():
             print(f"\n❌ 不支持 ecosystem={ecosystem}（找不到 {script_path.name}）")
             return
@@ -2775,7 +2776,12 @@ def main():
 
     # analyze 命令（保留用于向后兼容）
     analyze_parser2 = subparsers.add_parser("analyze", help="分析项目依赖（旧版）")
-    analyze_parser2.add_argument("project", help="项目路径或 pyproject.toml 路径")
+    analyze_parser2.add_argument(
+        "project",
+        nargs="?",
+        default=None,
+        help="项目路径或 pyproject.toml 路径（--list-parsers 时可省略）",
+    )
     analyze_parser2.add_argument("--conflicts", action="store_true", help="只检测冲突")
     analyze_parser2.add_argument(
         "--recommend", action="store_true", help="只获取版本推荐"
@@ -2801,6 +2807,11 @@ def main():
         action="store_true",
         help="分析冲突影响范围（反向追溯受影响包 + 依赖链）",
     )
+    analyze_parser2.add_argument(
+        "--list-parsers",
+        action="store_true",
+        help="列出各生态解析能力自省表（manifest/lockfile parser 实现状态）后退出",
+    )
     analyze_parser2.add_argument("-o", "--output", help="报告输出文件路径")
 
     # query 命令
@@ -2809,7 +2820,7 @@ def main():
     query_parser.add_argument(
         "-e",
         "--ecosystem",
-        choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
+        choices=eco_reg.ecosystem_names(),
         default="pypi",
         help="包生态系统 (默认: pypi)",
     )
@@ -2820,7 +2831,7 @@ def main():
     search_parser.add_argument(
         "-e",
         "--ecosystem",
-        choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
+        choices=eco_reg.ecosystem_names(),
         default="pypi",
         help="包生态系统 (默认: pypi)",
     )
@@ -2831,7 +2842,7 @@ def main():
     security_parser.add_argument(
         "-e",
         "--ecosystem",
-        choices=["pypi", "npm", "maven", "crates", "rubygems", "packagist", "nuget"],
+        choices=eco_reg.ecosystem_names(),
         default="pypi",
         help="包生态系统 (默认: pypi)；决定用哪个 registry 查最新版本",
     )
