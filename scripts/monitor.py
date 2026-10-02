@@ -41,14 +41,18 @@ MAX_HISTORY_ENTRIES = 50
 
 
 def run_scan(project_path: str,
-             scanner: Optional[Callable[[str], List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
+             scanner: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+             offline: bool = False,
+             cache: bool = False) -> Dict[str, Any]:
     """
     执行一次漏洞扫描
 
     Args:
         project_path: 项目路径
-        scanner: 可注入的扫描函数 (project_path) -> list[vuln_dict]
+        scanner: 可注入的扫描函数 (project_path, offline=…, cache=…) -> list
                  默认走 DependencyAnalyzer.assess_security
+        offline: True 时扫描只查本地 OSV 离线库（R9，需先下载离线库）
+        cache: True 时启用 OSV 查询 TTL 缓存（R9，~/.dayv/cache）
 
     Returns:
         {timestamp, project_path, vulnerabilities, total}
@@ -56,7 +60,7 @@ def run_scan(project_path: str,
     if scanner is None:
         scanner = _default_scanner
 
-    vulnerabilities = scanner(project_path)
+    vulnerabilities = scanner(project_path, offline=offline, cache=cache)
 
     return {
         "timestamp": float(time.time()),
@@ -217,12 +221,14 @@ def format_alert(new_vulns: List[Dict[str, Any]]) -> str:
 # ============ 私有工具函数 ============
 
 
-def _default_scanner(project_path: str) -> List[Dict[str, Any]]:
+def _default_scanner(project_path: str, offline: bool = False, cache: bool = False) -> List[Dict[str, Any]]:
     """
     默认 scanner: 用 DependencyAnalyzer 跑漏洞扫描
 
     Args:
         project_path: 项目路径
+        offline: True 时只查本地 OSV 离线库（R9）
+        cache: True 时启用 OSV 查询 TTL 缓存（R9）
 
     Returns:
         漏洞列表（dict schema，与 report_to_dict 输出一致）
@@ -231,7 +237,14 @@ def _default_scanner(project_path: str) -> List[Dict[str, Any]]:
     import dependency_analyzer
 
     packages, edges, _ = dependency_analyzer.parse_dependencies(project_path)
-    analyzer = dependency_analyzer.DependencyAnalyzer()
+    cache_ttl = None
+    if cache:
+        import osv_offline
+
+        cache_ttl = osv_offline.DEFAULT_ONLINE_TTL
+    analyzer = dependency_analyzer.DependencyAnalyzer(
+        offline_db=offline, cache_ttl=cache_ttl
+    )
 
     # 豁免清单（R7）：项目目录的 .dayv.toml 自动探测；配置非法显式失败不静默
     import exemptions as exemptions_mod

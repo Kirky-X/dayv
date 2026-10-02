@@ -30,6 +30,9 @@ class FakeAnalyzer:
     ignored_vulnerabilities: list = []
     osv_scan_status = {"scanned": True, "found": 0}
 
+    def __init__(self, *args, **kwargs):
+        pass
+
     def build_dependency_graph(self, packages, edges):
         pass
 

@@ -797,6 +797,10 @@ class DependencyAnalyzer:
         db_path: Optional[str] = None,
         http_client: Optional[RequestClient] = None,
         license_fetcher: Optional[Any] = None,
+        offline_db: bool = False,
+        osv_db_dir: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        cache_ttl: Optional[int] = None,
     ):
         """
         初始化分析器
@@ -808,10 +812,22 @@ class DependencyAnalyzer:
             license_fetcher: 可选 license 查询器（需有 fetch(name, ecosystem)
                          -> dict，可选 fetch_many；见 enrich_licenses）。
                          None 时内部构造 EcosystemFetcher。测试注入 mock 避免联网。
+            offline_db: True 时 OSV 查询只读本地离线库（--offline，R9）
+            osv_db_dir: 离线库目录覆盖（默认 ~/.dayv/osv_db）
+            cache_dir: OSV 查询缓存目录覆盖（默认 ~/.dayv/cache）
+            cache_ttl: 查询缓存 TTL 秒；None=禁用（默认，--cache 显式开启时
+                         为 osv_offline.DEFAULT_ONLINE_TTL；推断版本自动收敛
+                         ≤300s，防误报）
         """
         self.db = DependencyGraphDB(db_path)
         self._http = http_client or RequestClient(timeout=30.0)
         self._license_fetcher = license_fetcher
+        self.offline_db = offline_db
+        self.osv_db_dir = osv_db_dir
+        self.cache_dir = cache_dir
+        # 缓存显式开启（--cache，参照 dependency-cruiser opt-in 语义）；
+        # 默认关闭以保持既有行为与测试隔离（缓存持久化在 ~/.dayv/cache）
+        self.cache_ttl = cache_ttl
         # license 是否已采集回写 DB（见 _collect_license_info，每 analyzer 只采一次）
         self._license_enriched = False
         # 豁免清单（R7）：load_exemptions 产出，assess_security 消费；
@@ -860,24 +876,28 @@ class DependencyAnalyzer:
     def _query_osv_batch(
         self, packages: List[DependencyNode]
     ) -> Tuple[List[SecurityVulnerability], Dict[str, List[str]], int]:
-        """批量查询 OSV (https://api.osv.dev/v1/querybatch)。
+        """批量查询 OSV（在线 querybatch / --offline 本地库 / TTL 缓存三路）。
 
-        - ecosystem 映射: pypi→PyPI / npm→npm / maven→Maven / crates→crates.io
-          / rubygems→RubyGems / packagist→Packagist / nuget→NuGet
-        - 提交 package + version，由 OSV 服务端做版本过滤（仅返回受影响漏洞）
+        - ecosystem 映射来自 ecosystem_registry（单一来源）
+        - 提交 package + version（含 purl），由 OSV 服务端做版本过滤
+        - offline_db=True：只查本地离线库（R9），未下载生态显性跳过
+        - cache_ttl 非 None：逐包查 ~/.dayv/cache；推断版本整批 TTL 收敛 ≤300s
+          （防误报例外，osv_offline.effective_ttl）
         - 复用 utils.RequestClient 的重试 + 随机延迟限流
-        - 分片提交，每片 OSV_BATCH_CHUNK 个包
+        - 在线分片提交，每片 OSV_BATCH_CHUNK 个包
 
         Returns:
             (vulns, skipped, inferred_count) 三元组：
             - vulns: 解析出的漏洞列表
-            - skipped: 按原因分桶的被跳过包描述
-              {"unmapped_ecosystem": [...], "no_version": [...]}
+            - skipped: 按原因分桶的被跳过包描述（unmapped_ecosystem / no_version /
+              offline_db_missing / complex_ranges）
             - inferred_count: 以推断下界版本提交查询的包数（结果为保守近似）
 
         Raises:
             httpx.HTTPError / ValueError: 网络/HTTP/JSON 解析失败时抛出
         """
+        import osv_offline
+
         index, unmapped, no_version = _classify_osv_packages(packages)
         skipped: Dict[str, List[str]] = {
             "unmapped_ecosystem": unmapped,
@@ -893,39 +913,106 @@ class DependencyAnalyzer:
         if not index:
             return [], skipped, 0
 
-        queries = [_osv_query_for(pkg) for pkg in index]
-        all_results: List[Dict[str, Any]] = []
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        for i in range(0, len(queries), OSV_BATCH_CHUNK):
-            chunk = queries[i : i + OSV_BATCH_CHUNK]
-            response = self._http.post(
-                OSV_BATCH_URL, json={"queries": chunk}, headers=headers
+        # 与 index 等长对齐的结果数组（OSV 规范：results[k] 对应 queries[k]，无漏洞为 {}）
+        results: List[Dict[str, Any]] = [{} for _ in index]
+
+        if self.offline_db:
+            offline_results, extra_skipped = osv_offline.offline_query(
+                index, db_dir=self.osv_db_dir
             )
-            data = response.json()
-            if not isinstance(data, dict):
-                raise ValueError(f"OSV 响应非 JSON 对象: {type(data).__name__}")
-            chunk_results = data.get("results", [])
-            if not isinstance(chunk_results, list):
-                raise ValueError("OSV 响应 results 字段非列表")
-            # 对齐：OSV 规范保证 results 与 queries 等长（无漏洞的为 {}）
-            all_results.extend(chunk_results)
-            # 翻页：next_page_token 表示同一批查询还有更多漏洞
-            page_token = data.get("next_page_token")
-            while page_token:
-                body = {"queries": chunk, "page_token": page_token}
-                response = self._http.post(OSV_BATCH_URL, json=body, headers=headers)
-                data = response.json()
-                page_results = data.get("results", [])
-                for j, pr in enumerate(page_results):
-                    base = i + j
-                    if base < len(all_results):
-                        all_results[base].setdefault("vulns", []).extend(
-                            pr.get("vulns", []) if isinstance(pr, dict) else []
+            skipped.update(extra_skipped)
+            results = offline_results
+        else:
+            pending: List[int] = list(range(len(index)))
+            if self.cache_ttl is not None:
+                ttl = osv_offline.effective_ttl(
+                    self.cache_ttl, any(p.version_inferred for p in index)
+                )
+                pending = []
+                for k, pkg in enumerate(index):
+                    cached = osv_offline.cache_read(
+                        pkg.ecosystem,
+                        pkg.name,
+                        pkg.version,
+                        ttl,
+                        cache_dir=self.cache_dir,
+                    )
+                    if cached is not None:
+                        results[k] = {"vulns": cached}
+                    else:
+                        pending.append(k)
+
+            if pending:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+                for i in range(0, len(pending), OSV_BATCH_CHUNK):
+                    chunk_idx = pending[i : i + OSV_BATCH_CHUNK]
+                    chunk = [_osv_query_for(index[k]) for k in chunk_idx]
+                    response = self._http.post(
+                        OSV_BATCH_URL, json={"queries": chunk}, headers=headers
+                    )
+                    data = response.json()
+                    if not isinstance(data, dict):
+                        raise ValueError(f"OSV 响应非 JSON 对象: {type(data).__name__}")
+                    chunk_results = data.get("results", [])
+                    if not isinstance(chunk_results, list):
+                        raise ValueError("OSV 响应 results 字段非列表")
+                    self._merge_chunk_results(
+                        index, chunk_idx, chunk_results, results
+                    )
+                    # 翻页：next_page_token 表示同一批查询还有更多漏洞
+                    page_token = data.get("next_page_token")
+                    while page_token:
+                        body = {"queries": chunk, "page_token": page_token}
+                        response = self._http.post(
+                            OSV_BATCH_URL, json=body, headers=headers
                         )
-                page_token = data.get("next_page_token")
+                        data = response.json()
+                        page_results = data.get("results", [])
+                        self._merge_chunk_results(
+                            index, chunk_idx, page_results, results, extend=True
+                        )
+                        page_token = data.get("next_page_token")
+
+                    if self.cache_ttl is not None:
+                        for j, k in enumerate(chunk_idx):
+                            res = results[k]
+                            osv_offline.cache_write(
+                                index[k].ecosystem,
+                                index[k].name,
+                                index[k].version,
+                                res.get("vulns", []) if isinstance(res, dict) else [],
+                                cache_dir=self.cache_dir,
+                            )
 
         inferred_count = sum(1 for p in index if p.version_inferred)
-        return _parse_osv_results(index, all_results), skipped, inferred_count
+        return _parse_osv_results(index, results), skipped, inferred_count
+
+    @staticmethod
+    def _merge_chunk_results(
+        index: List[DependencyNode],
+        chunk_idx: List[int],
+        chunk_results: List[Any],
+        results: List[Dict[str, Any]],
+        extend: bool = False,
+    ) -> None:
+        """把 OSV 响应 results 与 chunk 的原 index 对齐合并。
+
+        - 首页：results[k] = chunk_results[j]
+        - 翻页（extend=True）：vulns 追加到既有条目
+        - 越界/非 dict 的响应位按 {} 处理（对齐缺口显性容忍，不猜测）
+        """
+        for j, k in enumerate(chunk_idx):
+            pr = chunk_results[j] if j < len(chunk_results) else {}
+            if not isinstance(pr, dict):
+                pr = {}
+            if extend:
+                base = results[k]
+                base.setdefault("vulns", []).extend(pr.get("vulns", []) or [])
+            else:
+                results[k] = pr
 
     def build_dependency_graph(
         self, packages: List[DependencyNode], dependencies: List[DependencyEdge]
@@ -1241,6 +1328,22 @@ class DependencyAnalyzer:
             scan_warnings.append(
                 f"漏洞扫描跳过 {len(no_version)} 个无确定版本的包"
                 f"（范围/通配约束无法定位具体版本，未查询 OSV）：{no_version}"
+            )
+        offline_missing = (
+            skipped.get("offline_db_missing", []) if isinstance(skipped, dict) else []
+        )
+        if offline_missing:
+            scan_warnings.append(
+                f"离线模式：{len(offline_missing)} 个包的生态离线库未下载，未扫描"
+                f"（未扫描≠无漏洞，可先 --download-offline-db）：{offline_missing}"
+            )
+        complex_ranges = (
+            skipped.get("complex_ranges", []) if isinstance(skipped, dict) else []
+        )
+        if complex_ranges:
+            scan_warnings.append(
+                f"离线匹配保守跳过 {len(complex_ranges)} 个含复杂受影响区间的包"
+                f"（last_affected/limit 等，可能漏报）：{complex_ranges}"
             )
         inferred_count = (status or {}).get("inferred_count", 0)
         if inferred_count:
@@ -1874,6 +1977,16 @@ def display_ignored_vulnerabilities(ignored: List[Dict[str, str]]) -> None:
         print(f"  - {item.get('cve_id', '?')} on {item.get('package', '?')}: {item.get('reason', '')}{until}{via}")
 
 
+def cache_ttl_from_args(args) -> Optional[int]:
+    """--cache 显式开启时返回默认 TTL，否则 None（禁用，opt-in 参照
+    dependency-cruiser；缓存持久化在 ~/.dayv/cache）。"""
+    if getattr(args, "cache", False):
+        import osv_offline
+
+        return osv_offline.DEFAULT_ONLINE_TTL
+    return None
+
+
 def load_exemptions_for(args, data: Dict[str, Any], data_path: Path) -> List[Any]:
     """组装 analyze-data 的豁免清单：--config 显式 > 数据文件旁/进程目录自动探测
     > deps_data 内联 ignored_vulns。配置非法显式退出（128），不静默忽略。"""
@@ -2413,7 +2526,7 @@ def cmd_analyze_data(args):
     logger.info(f"加载 {len(packages)} 个包, {len(edges)} 个依赖关系")
 
     # 创建分析器
-    analyzer = DependencyAnalyzer()
+    analyzer = DependencyAnalyzer(cache_ttl=cache_ttl_from_args(args))
     analyzer.exemptions = load_exemptions_for(args, data, data_path)
 
     # --exit-code 契约：任一执行分支发现的漏洞都计入退出判定
@@ -2884,8 +2997,25 @@ def cmd_security(args):
 
     print(f"最新版本: {latest_version}")
 
+    # 离线库（R9）：--download-offline-db 先下载；--offline 只查本地库
+    import osv_offline
+
+    offline = getattr(args, "offline", False)
+    if getattr(args, "download_offline_db", False):
+        try:
+            meta = osv_offline.download_offline_db([ecosystem])
+        except Exception as e:
+            print(f"\n❌ 离线库下载失败: {e}")
+            sys.exit(1)
+        print(f"📥 离线库已下载: {ecosystem}（{meta[ecosystem]['vulns']} 条漏洞）")
+    if offline and osv_offline.db_meta(ecosystem) is None:
+        print(f"\n❌ {ecosystem} 离线库未下载，请先运行 --download-offline-db")
+        sys.exit(EXIT_INPUT_ERROR)
+
     # 创建临时分析器
-    analyzer = DependencyAnalyzer()
+    analyzer = DependencyAnalyzer(
+        offline_db=offline, cache_ttl=cache_ttl_from_args(args)
+    )
 
     # 豁免清单（R7）：--config 显式或进程工作目录 .dayv.toml 自动探测
     import exemptions as exemptions_mod
@@ -3256,8 +3386,35 @@ def cmd_monitor(args):
     print(f"正在监控项目: {project_path}")
     print("=" * 70)
 
+    # 离线库（R9）：确定项目生态 → --download-offline-db 先下载；--offline 校验已下载
+    offline = getattr(args, "offline", False)
+    project_eco = "pypi"
+    dep_file = detect_dependency_file(project_path)
+    if dep_file:
+        entry = eco_reg.file_entry(Path(dep_file).name)
+        if entry:
+            project_eco = entry["ecosystem"]
+
+    if getattr(args, "download_offline_db", False):
+        import osv_offline
+
+        try:
+            meta = osv_offline.download_offline_db([project_eco])
+        except Exception as e:
+            logger.error(f"离线库下载失败: {e}")
+            sys.exit(1)
+        print(f"📥 离线库已下载: {project_eco}（{meta[project_eco]['vulns']} 条漏洞）")
+    if offline:
+        import osv_offline
+
+        if osv_offline.db_meta(project_eco) is None:
+            print(f"❌ {project_eco} 离线库未下载，请先运行 --download-offline-db")
+            sys.exit(EXIT_INPUT_ERROR)
+
     # 执行扫描
-    scan_result = monitor.run_scan(project_path)
+    scan_result = monitor.run_scan(
+        project_path, offline=offline, cache=getattr(args, "cache", False)
+    )
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(scan_result["timestamp"]))
     print(f"扫描时间: {ts}")
     print(f"漏洞总数: {scan_result['total']}")
@@ -3407,6 +3564,11 @@ def main():
         default=None,
         help="豁免配置 .dayv.toml 路径（默认自动探测数据文件旁/进程目录）",
     )
+    analyze_parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="OSV 查询结果缓存到 ~/.dayv/cache（TTL 24h；推断版本 ≤5min 防误报）",
+    )
 
     # analyze 命令（保留用于向后兼容）
     analyze_parser2 = subparsers.add_parser("analyze", help="分析项目依赖（旧版）")
@@ -3497,6 +3659,21 @@ def main():
         default=None,
         help="豁免配置 .dayv.toml 路径（默认自动探测进程工作目录）",
     )
+    security_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="只查本地 OSV 离线库（需先 --download-offline-db；未扫描项显性提示）",
+    )
+    security_parser.add_argument(
+        "--download-offline-db",
+        action="store_true",
+        help="先下载该包生态的 OSV 离线库到 ~/.dayv/osv_db/",
+    )
+    security_parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="OSV 查询结果缓存到 ~/.dayv/cache（TTL 24h；推断版本 ≤5min 防误报）",
+    )
 
     # report 命令
     report_parser = subparsers.add_parser(
@@ -3581,6 +3758,21 @@ def main():
     )
     monitor_parser.add_argument(
         "--webhook", default=None, help="webhook URL，检测到新漏洞时 POST 告警"
+    )
+    monitor_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="只查本地 OSV 离线库（需先 --download-offline-db）",
+    )
+    monitor_parser.add_argument(
+        "--download-offline-db",
+        action="store_true",
+        help="先下载项目生态对应的 OSV 离线库",
+    )
+    monitor_parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="OSV 查询结果缓存到 ~/.dayv/cache（TTL 24h；推断版本 ≤5min 防误报）",
     )
 
     # optimize 命令
