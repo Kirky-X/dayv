@@ -232,6 +232,15 @@ def _default_scanner(project_path: str) -> List[Dict[str, Any]]:
 
     packages, edges, _ = dependency_analyzer.parse_dependencies(project_path)
     analyzer = dependency_analyzer.DependencyAnalyzer()
+
+    # 豁免清单（R7）：项目目录的 .dayv.toml 自动探测；配置非法显式失败不静默
+    import exemptions as exemptions_mod
+
+    auto_config = exemptions_mod.find_config_file(project_path)
+    if auto_config:
+        logger.info(f"自动加载豁免配置: {auto_config}")
+        analyzer.exemptions = exemptions_mod.load_exemptions(str(auto_config))
+
     try:
         analyzer.build_dependency_graph(packages, edges)
         vulns = analyzer.assess_security()

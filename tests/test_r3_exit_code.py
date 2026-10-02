@@ -27,6 +27,7 @@ class FakeAnalyzer:
     """离线替身：assess_security 返回可配置漏洞集。"""
 
     vulns: list = []
+    ignored_vulnerabilities: list = []
     osv_scan_status = {"scanned": True, "found": 0}
 
     def build_dependency_graph(self, packages, edges):

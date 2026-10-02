@@ -157,6 +157,8 @@ class SecurityVulnerability:
     # OSV 真实 CVSS 数据（来自 severity[].score，供 prioritizer 精确评分）
     cvss_vector: Optional[str] = None
     cvss_score: Optional[float] = None
+    # OSV aliases（GHSA↔CVE 等连带标识；豁免清单按 id+alias 命中）
+    aliases: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -188,6 +190,8 @@ class AnalysisReport:
     scan_warnings: List[str] = field(default_factory=list)
     # 依赖许可证合规数据：非根包的 license 列表；无法获取的显式标 "UNKNOWN"
     license_info: List[Dict[str, str]] = field(default_factory=list)
+    # 被豁免清单过滤掉的漏洞（逐条带 reason/过期日，不静默消失——规则 11）
+    ignored_vulnerabilities: List[Dict[str, str]] = field(default_factory=list)
 
 
 # ============ OSV 响应解析（纯函数，便于离线单测） ============
@@ -349,11 +353,14 @@ def _parse_one_osv_vuln(
         if fixed_version:
             break
 
-    # 6. references
+    # 6. references + aliases
     references: List[str] = []
     for ref in vuln.get("references", []) or []:
         if isinstance(ref, dict) and isinstance(ref.get("url"), str):
             references.append(ref["url"])
+    aliases: List[str] = [
+        a for a in vuln.get("aliases", []) or [] if isinstance(a, str) and a
+    ]
 
     description = vuln.get("summary") or vuln.get("details") or ""
 
@@ -367,6 +374,7 @@ def _parse_one_osv_vuln(
         references=references,
         cvss_vector=cvss_vector,
         cvss_score=cvss_score,
+        aliases=aliases,
     )
 
 
@@ -440,6 +448,7 @@ class DependencyGraphDB:
                 fixed_version STRING,
                 cvss_vector STRING,
                 cvss_score DOUBLE,
+                aliases STRING,
                 PRIMARY KEY (cve_id)
             )
         """)
@@ -565,7 +574,8 @@ class DependencyGraphDB:
                     description: $description,
                     fixed_version: $fixed_version,
                     cvss_vector: $cvss_vector,
-                    cvss_score: $cvss_score
+                    cvss_score: $cvss_score,
+                    aliases: $aliases
                 })
             """,
                 {
@@ -579,6 +589,7 @@ class DependencyGraphDB:
                     "cvss_score": vuln.cvss_score
                     if vuln.cvss_score is not None
                     else -1.0,
+                    "aliases": ",".join(vuln.aliases or []),
                 },
             )
 
@@ -803,6 +814,10 @@ class DependencyAnalyzer:
         self._license_fetcher = license_fetcher
         # license 是否已采集回写 DB（见 _collect_license_info，每 analyzer 只采一次）
         self._license_enriched = False
+        # 豁免清单（R7）：load_exemptions 产出，assess_security 消费；
+        # ignored_vulnerabilities 保存最近一次过滤结果供报告显性列出
+        self.exemptions: List[Any] = []
+        self.ignored_vulnerabilities: List[Dict[str, str]] = []
         # OSV 漏洞扫描状态：未扫描时显式标注，禁止静默谎报"无漏洞"
         self.osv_scan_status: Dict[str, Any] = {
             "scanned": False,
@@ -1082,7 +1097,7 @@ class DependencyAnalyzer:
             MATCH (v:Vulnerability)-[:Affects]->(p:Package)
             RETURN v.cve_id, v.package, v.affected_version,
                    v.severity, v.description, v.fixed_version,
-                   v.cvss_vector, v.cvss_score
+                   v.cvss_vector, v.cvss_score, v.aliases
         """)
 
         vulnerabilities = []
@@ -1100,8 +1115,24 @@ class DependencyAnalyzer:
                 cvss_score=cvss_score
                 if isinstance(cvss_score, (int, float)) and cvss_score >= 0
                 else None,
+                aliases=[a for a in (row[8] or "").split(",") if a],
             )
             vulnerabilities.append(vuln)
+
+        # 豁免清单过滤（R7）：被豁免的漏洞转入 ignored_vulnerabilities 显性列出，
+        # 不静默消失；过期豁免自动失效（留在 vulnerabilities 恢复告警）
+        self.ignored_vulnerabilities = []
+        if self.exemptions:
+            import exemptions as exemptions_mod
+
+            vulnerabilities, self.ignored_vulnerabilities = (
+                exemptions_mod.apply_exemptions(vulnerabilities, self.exemptions)
+            )
+            if self.ignored_vulnerabilities:
+                logger.info(
+                    f"豁免清单生效：{len(self.ignored_vulnerabilities)} 个漏洞被过滤"
+                    f"（报告 ignored_vulnerabilities 段可见明细）"
+                )
 
         logger.info(f"发现 {len(vulnerabilities)} 个安全漏洞")
         return vulnerabilities
@@ -1241,6 +1272,7 @@ class DependencyAnalyzer:
             graph_stats=stats,
             scan_warnings=scan_warnings,
             license_info=license_info,
+            ignored_vulnerabilities=list(self.ignored_vulnerabilities),
         )
 
         return report
@@ -1332,6 +1364,7 @@ class DependencyAnalyzer:
             "recommendations": report.recommendations,
             "scan_warnings": report.scan_warnings,
             "license_info": report.license_info,
+            "ignored_vulnerabilities": report.ignored_vulnerabilities,
         }
 
     def export_report_json(self, report: AnalysisReport, output_file: str):
@@ -1824,6 +1857,41 @@ def display_update_paths(update_paths: List[UpdatePath]):
             logger.info(f"  建议: {path.recommendation}")
     else:
         logger.info("无需更新")
+
+
+def display_ignored_vulnerabilities(ignored: List[Dict[str, str]]) -> None:
+    """显性列出被豁免的漏洞（规则 11：不静默消失，逐条带理由与过期日）。"""
+    if not ignored:
+        return
+    print(f"\n📋 豁免清单生效：{len(ignored)} 个漏洞被过滤（明细如下）:")
+    for item in ignored:
+        until = f"，豁免至 {item['ignore_until']}" if item.get("ignore_until") else "，永久豁免"
+        via = (
+            f"（经由 alias {item['matched_via']} 命中）"
+            if item.get("matched_via") and item["matched_via"] != item.get("cve_id")
+            else ""
+        )
+        print(f"  - {item.get('cve_id', '?')} on {item.get('package', '?')}: {item.get('reason', '')}{until}{via}")
+
+
+def load_exemptions_for(args, data: Dict[str, Any], data_path: Path) -> List[Any]:
+    """组装 analyze-data 的豁免清单：--config 显式 > 数据文件旁/进程目录自动探测
+    > deps_data 内联 ignored_vulns。配置非法显式退出（128），不静默忽略。"""
+    import exemptions as exemptions_mod
+
+    collected: List[Any] = []
+    config = getattr(args, "config", None)
+    if config:
+        collected.extend(exemptions_mod.load_exemptions(config))
+    else:
+        auto = exemptions_mod.find_config_file(data_path.parent) or (
+            exemptions_mod.find_config_file(Path.cwd())
+        )
+        if auto:
+            logger.info(f"自动加载豁免配置: {auto}")
+            collected.extend(exemptions_mod.load_exemptions(str(auto)))
+    collected.extend(exemptions_mod.from_deps_data(data))
+    return collected
 
 
 def _deps_data_to_graph(data: Dict[str, Any]) -> Tuple[List[DependencyNode], List[DependencyEdge]]:
@@ -2346,6 +2414,7 @@ def cmd_analyze_data(args):
 
     # 创建分析器
     analyzer = DependencyAnalyzer()
+    analyzer.exemptions = load_exemptions_for(args, data, data_path)
 
     # --exit-code 契约：任一执行分支发现的漏洞都计入退出判定
     found_vulns: List[SecurityVulnerability] = []
@@ -2366,6 +2435,7 @@ def cmd_analyze_data(args):
         if args.security:
             vulns = analyzer.assess_security()
             display_vulnerabilities(vulns)
+            display_ignored_vulnerabilities(analyzer.ignored_vulnerabilities)
             found_vulns = vulns
 
         if args.updates:
@@ -2380,6 +2450,7 @@ def cmd_analyze_data(args):
 
             output_file = args.output if args.output else "dependency_report.json"
             analyzer.export_report_json(report, output_file)
+            display_ignored_vulnerabilities(report.ignored_vulnerabilities)
             logger.info(f"报告已保存到: {output_file}")
 
         # 显示摘要
@@ -2399,6 +2470,7 @@ def cmd_analyze_data(args):
             logger.info(f"冲突数: {len(conflicts)}")
             logger.info(f"安全漏洞: {len(vulns)}")
             logger.info(f"更新建议: {len(update_paths)}")
+            display_ignored_vulnerabilities(analyzer.ignored_vulnerabilities)
 
             if conflicts:
                 logger.warning(f"发现 {len(conflicts)} 个依赖冲突")
@@ -2815,6 +2887,18 @@ def cmd_security(args):
     # 创建临时分析器
     analyzer = DependencyAnalyzer()
 
+    # 豁免清单（R7）：--config 显式或进程工作目录 .dayv.toml 自动探测
+    import exemptions as exemptions_mod
+
+    config = getattr(args, "config", None)
+    if config:
+        analyzer.exemptions = exemptions_mod.load_exemptions(config)
+    else:
+        auto = exemptions_mod.find_config_file(Path.cwd())
+        if auto:
+            logger.info(f"自动加载豁免配置: {auto}")
+            analyzer.exemptions = exemptions_mod.load_exemptions(str(auto))
+
     try:
         # 用真实版本创建 DependencyNode
         pkg = DependencyNode(
@@ -2874,6 +2958,8 @@ def cmd_security(args):
                         print(f"  修复版本: {vuln.fixed_version}")
         else:
             print("\n✅ 未发现已知安全漏洞")
+
+        display_ignored_vulnerabilities(analyzer.ignored_vulnerabilities)
 
         # CI 门禁退出码：发现漏洞即按 --exit-code 指定的码退出（默认 0 兼容）
         exit_code = getattr(args, "exit_code", 0) or 0
@@ -3268,6 +3354,11 @@ def main():
         metavar="N",
         help="CI 门禁：发现漏洞时以 N 退出（默认 0 保持兼容；输入/解析失败恒为 128）",
     )
+    analyze_parser.add_argument(
+        "--config",
+        default=None,
+        help="豁免配置 .dayv.toml 路径（默认自动探测数据文件旁/进程目录）",
+    )
 
     # analyze 命令（保留用于向后兼容）
     analyze_parser2 = subparsers.add_parser("analyze", help="分析项目依赖（旧版）")
@@ -3352,6 +3443,11 @@ def main():
         default=0,
         metavar="N",
         help="CI 门禁：发现漏洞时以 N 退出（默认 0 保持兼容；输入错误恒为 128）",
+    )
+    security_parser.add_argument(
+        "--config",
+        default=None,
+        help="豁免配置 .dayv.toml 路径（默认自动探测进程工作目录）",
     )
 
     # report 命令
