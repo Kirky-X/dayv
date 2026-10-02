@@ -67,7 +67,11 @@ def parse_package_info(data: dict) -> dict:
     else:
         download_url = f"{NPM_REGISTRY_URL}/{name}/-/{name}-{latest}.tgz"
 
+    # 弃用信号（R15，零额外请求）：maintainer 在最新版本标了 deprecated 即视为弃用
+    deprecated = bool(versions_data.get(latest, {}).get("deprecated"))
+
     return {
+        "deprecated": deprecated,
         "name": name,
         "description": description,
         "latest_version": latest,

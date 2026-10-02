@@ -192,6 +192,8 @@ class AnalysisReport:
     license_info: List[Dict[str, str]] = field(default_factory=list)
     # 被豁免清单过滤掉的漏洞（逐条带 reason/过期日，不静默消失——规则 11）
     ignored_vulnerabilities: List[Dict[str, str]] = field(default_factory=list)
+    # 弃用包（R15：npm deprecated / crates yanked；无此元数据的生态不在列）
+    deprecated_packages: List[Dict[str, str]] = field(default_factory=list)
 
 
 # ============ OSV 响应解析（纯函数，便于离线单测） ============
@@ -414,6 +416,7 @@ class DependencyGraphDB:
                 license STRING,
                 homepage STRING,
                 download_count INT64,
+                deprecated BOOL,
                 PRIMARY KEY (name)
             )
         """)
@@ -485,7 +488,8 @@ class DependencyGraphDB:
                     description: $description, 
                     license: $license, 
                     homepage: $homepage, 
-                    download_count: $downloads
+                    download_count: $downloads,
+                    deprecated: $deprecated
                 })
             """,
                 {
@@ -497,6 +501,7 @@ class DependencyGraphDB:
                     "license": package.properties.get("license", ""),
                     "homepage": package.properties.get("homepage", ""),
                     "downloads": downloads,
+                    "deprecated": bool(package.properties.get("deprecated", False)),
                 },
             )
             return True
@@ -763,6 +768,39 @@ class DependencyGraphDB:
         except Exception as e:
             logger.error(f"回写 license 失败 {package_name}: {e}")
             return False
+
+    def set_deprecated(self, package_name: str, deprecated: bool) -> bool:
+        """回写弃用标记（R15；数据单一存储点与 license 同为 Package 节点）。"""
+        try:
+            self.conn.execute(
+                """
+                MATCH (p:Package {name: $name})
+                SET p.deprecated = $deprecated
+                """,
+                {"name": package_name, "deprecated": bool(deprecated)},
+            )
+            return True
+        except Exception as e:
+            logger.error(f"回写 deprecated 失败 {package_name}: {e}")
+            return False
+
+    def query_deprecated_packages(self) -> List[Dict[str, str]]:
+        """读取全部弃用标记的非根包（report deprecated_packages 段数据源）。"""
+        try:
+            result = self.conn.execute(
+                """
+                MATCH (p:Package) WHERE p.deprecated = true AND p.is_root = false
+                RETURN p.name, p.ecosystem, p.version
+                """
+            )
+            rows: List[Dict[str, str]] = []
+            while result.has_next():
+                name, eco, ver = result.get_next()
+                rows.append({"package": name, "ecosystem": eco, "version": ver})
+            return rows
+        except Exception as e:
+            logger.error(f"读取 deprecated 包失败: {e}")
+            return []
 
     def get_license_map(self) -> Dict[str, str]:
         """读取全部包的 license（name -> license 串，未回写的为空串）。"""
@@ -1360,8 +1398,10 @@ class DependencyAnalyzer:
             )
 
         # 采集依赖许可证（健康度"许可证合规"维度的真实数据源；
-        # 查询失败的包以 UNKNOWN 显式标注，不静默留空）
+        # 查询失败的包以 UNKNOWN 显式标注，不静默留空）。
+        # enrich_licenses 同批回写 deprecated 标记（零额外请求），随后读取
         license_info = self._collect_license_info()
+        deprecated_packages = self.db.query_deprecated_packages()
 
         report = AnalysisReport(
             timestamp=time.time(),
@@ -1376,6 +1416,7 @@ class DependencyAnalyzer:
             scan_warnings=scan_warnings,
             license_info=license_info,
             ignored_vulnerabilities=list(self.ignored_vulnerabilities),
+            deprecated_packages=deprecated_packages,
         )
 
         return report
@@ -1468,6 +1509,7 @@ class DependencyAnalyzer:
             "scan_warnings": report.scan_warnings,
             "license_info": report.license_info,
             "ignored_vulnerabilities": report.ignored_vulnerabilities,
+            "deprecated_packages": report.deprecated_packages,
         }
 
     def export_report_json(self, report: AnalysisReport, output_file: str):
@@ -2682,8 +2724,13 @@ def enrich_licenses(
         license_str = (info or {}).get("license", "") or ""
         # 数据层保持"无数据=空串"语义；报告层以 UNKNOWN 显式标注，禁止静默
         pkg.properties["license"] = license_str
+        # 弃用标记同批回写（R15：registry 响应自带，零额外请求；
+        # 无此元数据的生态 info 不含键 → False，报告侧即"不检测"）
+        deprecated = bool((info or {}).get("deprecated", False))
+        pkg.properties["deprecated"] = deprecated
         if db is not None:
             db.set_license(pkg.name, license_str)
+            db.set_deprecated(pkg.name, deprecated)
         license_info.append(
             {"package": pkg.name, "license": license_str or "UNKNOWN"}
         )
@@ -3175,9 +3222,10 @@ def cmd_report(args):
         report_dict["license_violations"] = policy["license_violations"]
         report_dict["license_unknown"] = policy["unknown"]
 
-    # 默认输出文件名
+    # 默认输出文件名（按格式区分扩展名）
     if output_file is None:
-        output_file = "dependency_report.json"
+        ext = {"json": "json", "html": "html", "pdf": "pdf", "sarif": "sarif"}.get(fmt, "json")
+        output_file = f"dependency_report.{ext}"
 
     # 按格式分派到 report_renderer
     import report_renderer

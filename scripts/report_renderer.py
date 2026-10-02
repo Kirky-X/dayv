@@ -341,6 +341,94 @@ def render_json(report: dict, output_path: str) -> str:
     return output_path
 
 
+# ============ SARIF 2.1.0（R15，参照 osv-scanner；可直接喂
+# github/codeql-action/upload-sarif 进 GitHub Security 页） ============
+
+_SARIF_LEVEL = {
+    "critical": "error",
+    "high": "error",
+    "medium": "warning",
+    "low": "note",
+}
+
+
+def render_sarif(report: dict) -> dict:
+    """
+    渲染报告为 SARIF 2.1.0 dict。
+
+    - 每个漏洞组一条 rule（ruleId=CVE/OSV id；dayv 解析时 aliases 已合并为
+      单一 cve_id，天然满足"aliases 合并为一条 rule"）
+    - level 按 severity 映射：critical/high→error、medium→warning、low→note
+    - message 含包名@版本与修复版本
+    """
+    vulns = report.get("vulnerabilities", []) or []
+    rules = []
+    results = []
+    seen_rules = set()
+    for v in vulns:
+        rule_id = v.get("cve_id") or "UNKNOWN-VULN"
+        severity = (v.get("severity", "low") or "low").lower()
+        level = _SARIF_LEVEL.get(severity, "note")
+        if rule_id not in seen_rules:
+            seen_rules.add(rule_id)
+            rules.append(
+                {
+                    "id": rule_id,
+                    "name": rule_id,
+                    "shortDescription": {
+                        "text": f"{rule_id} 影响 {v.get('package', '?')}"
+                    },
+                    "helpUri": f"https://osv.dev/vulnerability/{rule_id}",
+                    "defaultConfiguration": {"level": level},
+                    "properties": {"severity": severity},
+                }
+            )
+        message = f"{v.get('package', '?')}@{v.get('version', '')} 受 {rule_id} 影响"
+        if v.get("fixed_version"):
+            message += f"，修复版本 {v['fixed_version']}"
+        results.append(
+            {
+                "ruleId": rule_id,
+                "level": level,
+                "message": {"text": message},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {
+                                "uri": f"{v.get('package', '?')}@{v.get('version', '')}",
+                            }
+                        }
+                    }
+                ],
+            }
+        )
+    return {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "dayv",
+                        "informationUri": "https://github.com/Kirky-X/dayv",
+                        "rules": rules,
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+
+
+def _write_json_file(payload: dict, output_path: str, log_label: str) -> str:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    logger.info(f"{log_label} 已生成: {output_path}")
+    return output_path
+
+
 def render_report(report: dict, output_path: str, fmt: str = "json") -> str:
     """
     按格式分派渲染器
@@ -369,7 +457,9 @@ def render_report(report: dict, output_path: str, fmt: str = "json") -> str:
         return output_path
     elif fmt_lower == "pdf":
         return render_pdf(report, output_path)
+    elif fmt_lower == "sarif":
+        return _write_json_file(render_sarif(report), output_path, "SARIF 报告")
     else:
         raise ValueError(
-            f"不支持的报告格式: {fmt}。支持的格式: json, html, pdf"
+            f"不支持的报告格式: {fmt}。支持的格式: json, html, pdf, sarif"
         )

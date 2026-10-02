@@ -65,6 +65,9 @@ def parse_package_info(data: dict) -> dict:
         # versions 按时间倒序，第一个是最新的
         license = versions_data[0].get("license", "") if versions_data else ""
 
+    # 弃用信号（R15，零额外请求）：返回的近期版本中存在 yanked 即标记
+    deprecated = any(bool(v.get("yanked")) for v in versions_data[:20])
+
     # 下载 URL
     download_url = f"{CRATES_BASE_URL}/api/v1/crates/{name}"
 
@@ -72,6 +75,7 @@ def parse_package_info(data: dict) -> dict:
     homepage = crate.get("homepage", "") or crate.get("documentation", "")
 
     return {
+        "deprecated": deprecated,
         "name": name,
         "description": description,
         "latest_version": latest_version,

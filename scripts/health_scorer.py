@@ -43,6 +43,10 @@ DIMENSION_WEIGHTS = {
 # 单个冲突的扣分值
 CONFLICT_PENALTY = 25
 
+# 单个弃用包的维护维度扣分（R15：npm deprecated / crates yanked）
+DEPRECATED_PENALTY = 10
+DEPRECATED_PENALTY_CAP = 30
+
 # 阈值
 THRESHOLD_HEALTHY = 70
 THRESHOLD_WARNING = 50
@@ -101,13 +105,14 @@ def _score_vulnerability(report: dict) -> float:
 
 def _score_maintenance(report: dict) -> float:
     """
-    维护状态评分：基于是否有更新活动 + 是否无漏洞
+    维护状态评分：基于是否有更新活动 + 是否无漏洞 + 弃用包扣分（R15）
 
     逻辑:
       - base = 50
       - 有 update_paths（说明项目活跃可升级）: +25
       - 无漏洞（说明维护质量好）: +25
-      - 上限 100
+      - 弃用包: 每个 -10（上限 -30）
+      - 上限 100，下限 0
     """
     total = report.get("summary", {}).get("total_packages", 0)
     if total == 0:
@@ -118,7 +123,12 @@ def _score_maintenance(report: dict) -> float:
         base += 25.0
     if not report.get("vulnerabilities"):
         base += 25.0
-    return min(100.0, base)
+    deprecated_count = len(report.get("deprecated_packages") or [])
+    if deprecated_count:
+        base -= min(
+            DEPRECATED_PENALTY_CAP, deprecated_count * DEPRECATED_PENALTY
+        )
+    return max(0.0, min(100.0, base))
 
 
 def _score_stability(report: dict) -> float:
@@ -214,7 +224,7 @@ def score_health(report: dict) -> dict:
     else:
         level = "danger"
 
-    suggestions = _generate_suggestions(dims)
+    suggestions = _generate_suggestions(dims, report)
 
     return {
         "total_score": total,
@@ -224,9 +234,19 @@ def score_health(report: dict) -> dict:
     }
 
 
-def _generate_suggestions(dims: Dict[str, float]) -> List[str]:
+def _generate_suggestions(dims: Dict[str, float], report: dict) -> List[str]:
     """针对最低分维度生成改进建议"""
     suggestions = []
+
+    # 弃用包（R15）：无论哪个维度最低都显性提示（维护风险独立于分数）
+    deprecated = report.get("deprecated_packages") or []
+    if deprecated:
+        names = ", ".join(p.get("package", "?") for p in deprecated[:5])
+        more = f" 等 {len(deprecated)} 个" if len(deprecated) > 5 else ""
+        suggestions.append(
+            f"检测到弃用依赖: {names}{more}（npm deprecated / crates yanked），"
+            "建议规划替换方案"
+        )
 
     # 找最低分维度
     lowest_name = min(dims, key=lambda k: dims[k])
