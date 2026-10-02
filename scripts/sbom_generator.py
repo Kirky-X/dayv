@@ -214,3 +214,114 @@ def write_sbom(packages: List[Dict[str, Any]],
 
     logger.info(f"SBOM 已生成: {output_path}")
     return output_path
+
+
+# ============ CycloneDX 1.5（R6，复用 purl 模块） ============
+
+CDX_SPEC_VERSION = "1.5"
+
+
+def _cdx_bom_ref(name: str, version: str) -> str:
+    """bom-ref： Synthetic identifier (must be unique within the document)."""
+    safe = "".join(c if c.isalnum() or c in ".-_" else "-" for c in f"{name}@{version}")
+    return f"dayv:{safe}"
+
+
+def generate_cyclonedx(packages: List[Dict[str, Any]],
+                       edges: List[Dict[str, Any]],
+                       project_name: str) -> Dict[str, Any]:
+    """
+    Generate CycloneDX 1.5 JSON dictionary.
+
+    - Root package → metadata.component (type=application); remaining packages → components[]
+    - Each component carries purl (single-point module construction); license attached when present
+    - dependencies[]: ref → dependsOn three-part assembly (SBOM is positioned as an interchange format,
+      authoritative data still lives in the graph DB)
+    """
+    components: List[Dict[str, Any]] = []
+    ref_by_name: Dict[str, str] = {}
+    root_component: Dict[str, Any] = {}
+
+    for pkg in packages:
+        name = pkg.get("name", "unknown")
+        version = str(pkg.get("version", "") or "")
+        ecosystem = pkg.get("ecosystem", "")
+        license_info = pkg.get("license", "")
+
+        purl_str = purl_mod.make_purl(name, ecosystem, version or None)
+        ref = _cdx_bom_ref(name, version)
+        component: Dict[str, Any] = {
+            "type": "library",
+            "bom-ref": ref,
+            "name": name,
+            "version": version,
+        }
+        if purl_str:
+            component["purl"] = purl_str
+        if license_info and license_info.upper() not in ("UNKNOWN", "NOASSERTION"):
+            component["licenses"] = [{"license": {"id": license_info}}]
+
+        if pkg.get("is_root") and not root_component:
+            root_component = {**component, "type": "application"}
+        else:
+            components.append(component)
+            ref_by_name[name] = ref
+
+    if not root_component and packages:
+        first = packages[0]
+        ref = _cdx_bom_ref(first.get("name", "unknown"), str(first.get("version", "") or ""))
+        root_component = {
+            "type": "application",
+            "bom-ref": ref,
+            "name": first.get("name", "unknown"),
+            "version": str(first.get("version", "") or ""),
+        }
+
+    # dependencies[]: ref → dependsOn (src side is the root when the name is not in the component table)
+    depends_map: Dict[str, List[str]] = {}
+    for edge in edges:
+        src = edge.get("source", "")
+        tgt = edge.get("target", "")
+        src_ref = ref_by_name.get(src, root_component.get("bom-ref", ""))
+        tgt_ref = ref_by_name.get(tgt)
+        if not src_ref or tgt_ref is None:
+            logger.warning(f"Skipping CycloneDX dependency relationship {src} -> {tgt}: missing corresponding bom-ref")
+            continue
+        depends_map.setdefault(src_ref, [])
+        if tgt_ref not in depends_map[src_ref]:
+            depends_map[src_ref].append(tgt_ref)
+
+    dependencies = []
+    all_refs = [root_component["bom-ref"]] + [c["bom-ref"] for c in components]
+    for ref in all_refs:
+        dependencies.append({"ref": ref, "dependsOn": depends_map.get(ref, [])})
+
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": CDX_SPEC_VERSION,
+        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+        "version": 1,
+        "metadata": {
+            "timestamp": _format_created_timestamp(),
+            "tools": [{"vendor": "dayv", "name": "dayv-dependency-analyzer"}],
+            "component": root_component,
+        },
+        "components": components,
+        "dependencies": dependencies,
+    }
+
+
+def write_cyclonedx(packages: List[Dict[str, Any]],
+                    edges: List[Dict[str, Any]],
+                    project_name: str,
+                    output_path: str = None) -> str:
+    """Generate CycloneDX SBOM and write a .cdx.json file (usable for re-scanning by trivy sbom / osv-scanner)."""
+    cdx = generate_cyclonedx(packages, edges, project_name)
+    if output_path is None:
+        output_path = f"{project_name}-sbom.cdx.json"
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as f:
+        json.dump(cdx, f, indent=2, ensure_ascii=False)
+    logger.info(f"CycloneDX SBOM generated: {output_path}")
+    return output_path

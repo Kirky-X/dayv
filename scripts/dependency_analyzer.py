@@ -2308,6 +2308,137 @@ def _deps_data_to_graph(data: Dict[str, Any]) -> Tuple[List[DependencyNode], Lis
     return packages, edges
 
 
+def _sbom_to_deps_data(path: Path) -> Dict[str, Any]:
+    """读 SPDX / CycloneDX SBOM → deps_data dict（R6：SBOM 反向作为输入）。
+
+    SBOM 的 version 为精确锁定（version_resolved=True）；license 的
+    NOASSERTION/UNKNOWN 归一为空串（数据层"无数据"语义）。
+    """
+    import purl as purl_mod
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"解析 SBOM JSON 失败: {e}")
+        sys.exit(EXIT_INPUT_ERROR)
+
+    packages: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+
+    def _norm_license(lic: str) -> str:
+        return "" if not lic or lic.upper() in ("UNKNOWN", "NOASSERTION") else lic
+
+    if str(data.get("SPDXVersion", "")).startswith("SPDX-") or data.get("spdxVersion"):
+        id_to_name: Dict[str, Dict[str, Any]] = {}
+        for pkg in data.get("Packages", []) or []:
+            name = pkg.get("Name", "")
+            version = str(pkg.get("VersionInfo", "") or "")
+            ecosystem = "pypi"
+            for ref in pkg.get("externalRefs", []) or []:
+                if ref.get("referenceType", "").lower() == "purl":
+                    parsed = purl_mod.parse_purl(ref.get("referenceLocator", ""))
+                    if parsed:
+                        ecosystem = parsed["ecosystem"]
+            entry = {
+                "name": name,
+                "version": version,
+                "ecosystem": ecosystem,
+                "is_root": False,
+                "license": _norm_license(pkg.get("LicenseConcluded", "")),
+                "version_resolved": True,
+            }
+            packages.append(entry)
+            id_to_name[pkg.get("SPDXID", "")] = entry
+        for rel in data.get("Relationships", []) or []:
+            if rel.get("RelationshipType") != "DEPENDS_ON":
+                continue
+            src = id_to_name.get(rel.get("SPDXElementID", ""))
+            tgt = id_to_name.get(rel.get("RelatedSPDXElement", ""))
+            if src and tgt:
+                edges.append(
+                    {
+                        "source": src["name"],
+                        "target": tgt["name"],
+                        "constraint": "*",
+                    }
+                )
+        # 根：DocumentName/第一个 DESCRIBES 目标
+        described = next(
+            (
+                rel.get("RelatedSPDXElement")
+                for rel in data.get("Relationships", []) or []
+                if rel.get("RelationshipType") == "DESCRIBES"
+            ),
+            None,
+        )
+        if described in id_to_name:
+            id_to_name[described]["is_root"] = True
+        elif packages:
+            packages[0]["is_root"] = True
+        return {"packages": packages, "edges": edges}
+
+    if data.get("bomFormat") == "CycloneDX":
+        meta_component = (data.get("metadata") or {}).get("component") or {}
+        root_ref = meta_component.get("bom-ref", "")
+        ref_to_entry: Dict[str, Dict[str, Any]] = {}
+        for comp in data.get("components", []) or []:
+            purl_str = comp.get("purl", "")
+            ecosystem = "pypi"
+            name = comp.get("name", "")
+            if purl_str:
+                parsed = purl_mod.parse_purl(purl_str)
+                if parsed:
+                    ecosystem = parsed["ecosystem"]
+            lic_str = ""
+            licenses = comp.get("licenses") or []
+            if licenses:
+                first = licenses[0]
+                lic_obj = first.get("license") or first.get("expression") or {}
+                lic_str = (
+                    lic_obj.get("id") or lic_obj.get("name") or ""
+                    if isinstance(lic_obj, dict)
+                    else str(first.get("expression", ""))
+                )
+            entry = {
+                "name": name,
+                "version": str(comp.get("version", "") or ""),
+                "ecosystem": ecosystem,
+                "is_root": False,
+                "license": _norm_license(lic_str),
+                "version_resolved": True,
+            }
+            packages.append(entry)
+            ref_to_entry[comp.get("bom-ref", "")] = entry
+        root_entry = {
+            "name": meta_component.get("name", "unknown"),
+            "version": str(meta_component.get("version", "") or ""),
+            "ecosystem": "pypi",
+            "is_root": True,
+            "license": "",
+            "version_resolved": bool(meta_component.get("version")),
+        }
+        packages.insert(0, root_entry)
+        root_ref = root_ref or root_entry["name"]
+        ref_to_entry[root_ref] = root_entry
+        for dep in data.get("dependencies", []) or []:
+            src = ref_to_entry.get(dep.get("ref", ""))
+            for tgt_ref in dep.get("dependsOn", []) or []:
+                tgt = ref_to_entry.get(tgt_ref)
+                if src and tgt and src is not tgt:
+                    edges.append(
+                        {
+                            "source": src["name"],
+                            "target": tgt["name"],
+                            "constraint": "*",
+                        }
+                    )
+        return {"packages": packages, "edges": edges}
+
+    logger.error("无法识别的 SBOM 格式（支持 SPDX 2.x 与 CycloneDX）")
+    sys.exit(EXIT_INPUT_ERROR)
+
+
 # ============ lockfile 解析器（R4：精确版本来源，优先于 manifest） ============
 # 每个 parser 返回 (packages, edges)：packages 含根节点（is_root=True，来自同目录
 # manifest 或 lockfile 自身的根条目），所有非根节点 version_resolved=True 且
@@ -2759,26 +2890,39 @@ PARSER_FUNCS = {
 
 
 def cmd_analyze_data(args):
-    """分析依赖数据文件"""
+    """分析依赖数据文件（支持 --from-sbom 反向读 SPDX/CycloneDX）"""
     data_file = args.data_file
-    data_path = Path(data_file)
+    if not data_file and not getattr(args, "from_sbom", None):
+        logger.error("analyze-data 需要 deps_data.json 或 --from-sbom <file>")
+        sys.exit(EXIT_INPUT_ERROR)
+    data_path = Path(data_file or "deps_data.json")
 
-    if not data_path.exists():
+    if data_file and not data_path.exists():
         logger.error(f"找不到文件 {data_file}")
         sys.exit(EXIT_INPUT_ERROR)
 
-    # 读取 JSON 数据
-    try:
-        with data_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError as e:
-        logger.error(f"解析 JSON 文件失败: {e}")
-        sys.exit(EXIT_INPUT_ERROR)
+    if getattr(args, "from_sbom", None):
+        import sbom_generator  # noqa: F401  （确认 SBOM 模块可用）
 
-    # 验证数据格式
-    if "packages" not in data or "edges" not in data:
-        logger.error("JSON 文件必须包含 'packages' 和 'edges' 字段")
-        sys.exit(EXIT_INPUT_ERROR)
+        logger.info(f"从 SBOM 读取依赖: {args.from_sbom}")
+        sbom_path = Path(args.from_sbom)
+        if not sbom_path.exists():
+            logger.error(f"找不到 SBOM 文件 {args.from_sbom}")
+            sys.exit(EXIT_INPUT_ERROR)
+        data = _sbom_to_deps_data(sbom_path)
+    else:
+        # 读取 JSON 数据
+        try:
+            with data_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"解析 JSON 文件失败: {e}")
+            sys.exit(EXIT_INPUT_ERROR)
+
+        # 验证数据格式
+        if "packages" not in data or "edges" not in data:
+            logger.error("JSON 文件必须包含 'packages' 和 'edges' 字段")
+            sys.exit(EXIT_INPUT_ERROR)
 
     logger.info(f"正在分析依赖数据: {data_file}")
 
@@ -3393,6 +3537,26 @@ def cmd_report(args):
         logger.error("JSON 文件必须包含 'packages' 和 'edges' 字段")
         sys.exit(EXIT_INPUT_ERROR)
 
+    # CycloneDX 格式：直接用 packages + edges 生成 cdx JSON（无需分析报告）
+    if fmt == "cyclonedx":
+        import sbom_generator
+
+        project_name = data["packages"][0]["name"] if data["packages"] else "unknown"
+        if output_file is None:
+            output_file = f"{project_name}-sbom.cdx.json"
+        try:
+            result_path = sbom_generator.write_cyclonedx(
+                packages=data["packages"],
+                edges=data["edges"],
+                project_name=project_name,
+                output_path=output_file,
+            )
+            print(f"CycloneDX SBOM 已生成: {result_path}")
+        except Exception as e:
+            logger.error(f"CycloneDX 生成失败: {e}")
+            sys.exit(1)
+        return
+
     # SBOM 格式：直接用 packages + edges 生成 SPDX（无需分析报告）
     if fmt == "sbom":
         import sbom_generator
@@ -3809,7 +3973,18 @@ def main():
 
     # analyze-data 命令
     analyze_parser = subparsers.add_parser("analyze-data", help="分析依赖数据文件")
-    analyze_parser.add_argument("data_file", help="JSON 格式的依赖数据文件")
+    analyze_parser.add_argument(
+        "data_file",
+        nargs="?",
+        default=None,
+        help="JSON 格式的依赖数据文件（--from-sbom 时可省略）",
+    )
+    analyze_parser.add_argument(
+        "--from-sbom",
+        default=None,
+        metavar="FILE",
+        help="以 SPDX/CycloneDX SBOM 作为依赖输入（反向消费 syft/osv-scanner 产物）",
+    )
     analyze_parser.add_argument("--conflicts", action="store_true", help="只检测冲突")
     analyze_parser.add_argument(
         "--recommend", action="store_true", help="只获取版本推荐"
