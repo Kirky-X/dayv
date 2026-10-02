@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import ecosystem_registry as eco_reg
+import purl as purl_mod
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,17 @@ def generate_sbom(packages: List[Dict[str, Any]],
             "LicenseConcluded": license_info if license_info else DEFAULT_LICENSE,
             "Supplier": DEFAULT_SUPPLIER,
         }
+        # purl externalRefs：下游（osv-scanner --sbom / trivy sbom）靠它识别包。
+        # purl 构造不出（生态未知）时省略字段，不写假值。
+        purl_str = purl_mod.make_purl(name, ecosystem, version or None)
+        if purl_str:
+            pkg_entry["externalRefs"] = [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": purl_str,
+                }
+            ]
         packages_sbom.append(pkg_entry)
 
     # 构建 Relationships

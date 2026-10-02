@@ -46,6 +46,7 @@ except ImportError:
     _sys.exit(1)
 
 import ecosystem_registry as eco_reg
+import purl as purl_mod
 from utils import (
     RequestClient,
     check_version_constraint,
@@ -211,9 +212,21 @@ def _classify_osv_packages(
 
 
 def _osv_query_for(pkg: DependencyNode) -> Dict[str, Any]:
-    """构造单个包的 OSV querybatch 查询项。"""
+    """构造单个包的 OSV querybatch 查询项。
+
+    package.purl 由 purl 单点模块构造（osv-scanner 同款标识，提升
+    maven/nuget 等歧义名匹配）；构造失败时仅省略 purl 字段，不影响
+    ecosystem+name+version 的既有匹配路径。
+    """
+    package: Dict[str, Any] = {
+        "ecosystem": OSV_ECOSYSTEM_MAP[pkg.ecosystem],
+        "name": pkg.name,
+    }
+    purl_str = purl_mod.make_purl(pkg.name, pkg.ecosystem, pkg.version or None)
+    if purl_str:
+        package["purl"] = purl_str
     return {
-        "package": {"ecosystem": OSV_ECOSYSTEM_MAP[pkg.ecosystem], "name": pkg.name},
+        "package": package,
         "version": pkg.version,
     }
 
