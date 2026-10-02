@@ -2100,6 +2100,242 @@ def parse_requirements_txt(
     return packages, edges
 
 
+# ============ 未实现 parser 的最小解析 + deps.dev 增强（R10） ============
+
+
+def _parse_cargo_toml_minimal(path_obj: Path, ecosystem: str):
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+    with path_obj.open("rb") as f:
+        data = tomllib.load(f)
+    pkg_info = data.get("package") or {}
+    root_name = pkg_info.get("name", "unknown")
+    root_version = str(pkg_info.get("version", "") or "")
+    packages = [
+        DependencyNode(name=root_name, version=root_version, ecosystem=ecosystem, is_root=True)
+    ]
+    edges: List[DependencyEdge] = []
+    for group, group_key in (("dependencies", "dependencies"), ("dev", "dev-dependencies")):
+        for dep_name, spec in (data.get(group_key) or {}).items():
+            constraint = (
+                str(spec.get("version", "")) if isinstance(spec, dict) else str(spec or "")
+            ) or "*"
+            resolved = _extract_concrete_version(constraint)
+            node = DependencyNode(
+                name=str(dep_name),
+                version=resolved[0] if resolved else "",
+                ecosystem=ecosystem,
+                version_inferred=bool(resolved) and resolved[1],
+                properties={"group": group},
+            )
+            if node.name not in {p.name for p in packages}:
+                packages.append(node)
+            edges.append(
+                DependencyEdge(source=root_name, target=str(dep_name), constraint=constraint,
+                               properties={"group": group})
+            )
+    return packages, edges, root_name, root_version
+
+
+def _parse_pom_xml_minimal(path_obj: Path, ecosystem: str):
+    text = path_obj.read_text(encoding="utf-8", errors="replace")
+    block_re = re.compile(
+        r"<dependency>\s*<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>"
+        r"(?:\s*<version>([^<]+)</version>)?\s*</dependency>",
+        re.S,
+    )
+    first_group = re.search(r"<groupId>([^<]+)</groupId>", text)
+    first_artifact = re.search(r"<artifactId>([^<]+)</artifactId>", text)
+    root_name = (
+        f"{first_group.group(1)}:{first_artifact.group(1)}"
+        if first_group and first_artifact
+        else "unknown"
+    )
+    root_version_m = re.search(
+        r"<project[^>]*>.*?<version>([^<]+)</version>", text, re.S
+    )
+    root_version = root_version_m.group(1) if root_version_m else ""
+    packages = [
+        DependencyNode(name=root_name, version=root_version, ecosystem=ecosystem, is_root=True)
+    ]
+    edges: List[DependencyEdge] = []
+    seen: set = set()
+    for m in block_re.finditer(text):
+        g, a, v = m.group(1).strip(), m.group(2).strip(), (m.group(3) or "").strip()
+        name = f"{g}:{a}"
+        if name in seen:
+            continue
+        seen.add(name)
+        constraint = v or "*"
+        resolved = _extract_concrete_version(constraint)
+        packages.append(
+            DependencyNode(
+                name=name,
+                version=resolved[0] if resolved else "",
+                ecosystem=ecosystem,
+                version_inferred=bool(resolved) and resolved[1],
+            )
+        )
+        edges.append(DependencyEdge(source=root_name, target=name, constraint=constraint))
+    return packages, edges, root_name, root_version
+
+
+def _parse_gemfile_minimal(path_obj: Path, ecosystem: str):
+    root_name = path_obj.parent.name or "unknown"
+    packages = [
+        DependencyNode(name=root_name, version="", ecosystem=ecosystem, is_root=True)
+    ]
+    edges: List[DependencyEdge] = []
+    seen: set = set()
+    for line in path_obj.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"""\s*gem\s+["']([^"']+)["'](?:\s*,\s*["']([^"']+)["'])?""", line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        constraint = m.group(2) or "*"
+        resolved = _extract_concrete_version(constraint)
+        packages.append(
+            DependencyNode(
+                name=name,
+                version=resolved[0] if resolved else "",
+                ecosystem=ecosystem,
+                version_inferred=bool(resolved) and resolved[1],
+            )
+        )
+        edges.append(DependencyEdge(source=root_name, target=name, constraint=constraint))
+    return packages, edges, root_name, ""
+
+
+def _parse_composer_json_minimal(path_obj: Path, ecosystem: str):
+    with path_obj.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    root_name = data.get("name", "unknown")
+    packages = [
+        DependencyNode(name=root_name, version="", ecosystem=ecosystem, is_root=True)
+    ]
+    edges: List[DependencyEdge] = []
+    seen: set = set()
+    for dep_name, constraint in (data.get("require") or {}).items():
+        if dep_name == "php" or str(dep_name).startswith(("ext-", "lib-")):
+            continue
+        if dep_name in seen:
+            continue
+        seen.add(str(dep_name))
+        constraint = str(constraint or "*")
+        resolved = _extract_concrete_version(constraint)
+        packages.append(
+            DependencyNode(
+                name=str(dep_name),
+                version=resolved[0] if resolved else "",
+                ecosystem=ecosystem,
+                version_inferred=bool(resolved) and resolved[1],
+            )
+        )
+        edges.append(DependencyEdge(source=root_name, target=str(dep_name), constraint=constraint))
+    return packages, edges, root_name, ""
+
+
+def _parse_csproj_minimal(path_obj: Path, ecosystem: str):
+    root_name = path_obj.stem or path_obj.parent.name or "unknown"
+    text = path_obj.read_text(encoding="utf-8", errors="replace")
+    packages = [
+        DependencyNode(name=root_name, version="", ecosystem=ecosystem, is_root=True)
+    ]
+    edges: List[DependencyEdge] = []
+    seen: set = set()
+    for m in re.finditer(
+        r'<PackageReference\s+Include="([^"]+)"(?:\s+Version="([^"]+)")?', text
+    ):
+        name, version = m.group(1), (m.group(2) or "").strip()
+        if name in seen:
+            continue
+        seen.add(name)
+        constraint = version or "*"
+        resolved = _extract_concrete_version(constraint)
+        packages.append(
+            DependencyNode(
+                name=name,
+                version=resolved[0] if resolved else "",
+                ecosystem=ecosystem,
+                version_inferred=bool(resolved) and resolved[1],
+            )
+        )
+        edges.append(DependencyEdge(source=root_name, target=name, constraint=constraint))
+    return packages, edges, root_name, ""
+
+
+_MINIMAL_PARSERS = {
+    "Cargo.toml": _parse_cargo_toml_minimal,
+    "pom.xml": _parse_pom_xml_minimal,
+    "Gemfile": _parse_gemfile_minimal,
+    "composer.json": _parse_composer_json_minimal,
+    ".csproj": _parse_csproj_minimal,
+    ".fsproj": _parse_csproj_minimal,
+    ".vbproj": _parse_csproj_minimal,
+}
+
+
+def _depsdev_enrich(
+    packages: List[DependencyNode],
+    edges: List[DependencyEdge],
+    root_name: str,
+    root_version: str,
+    ecosystem: str,
+) -> None:
+    """deps.dev GetDependencies 服务端传递图增强（仅 npm/crates/maven/pypi 覆盖）。
+
+    增强信号：失败（网络/不支持/限流）降级并在根节点 manifest_notes 显性
+    标注——直接依赖的本地近似结果不受影响。
+    """
+    import depsdev_client
+
+    if ecosystem not in depsdev_client.DEPENDENCIES_ECOS or not root_version:
+        return
+    payload = depsdev_client.get_dependencies(ecosystem, root_name, root_version)
+    if not payload:
+        packages[0].properties.setdefault("manifest_notes", []).append(
+            f"deps.dev 不可达或不支持 {ecosystem} 的传递依赖解析，"
+            f"本次分析仅含直接依赖的本地近似（传递依赖未扫描）"
+        )
+        return
+    nodes, dep_edges = depsdev_client.normalize_dependencies_payload(payload, ecosystem)
+    root_key = f"{root_name}@{root_version}"
+    existing_names = {p.name for p in packages}
+    key_to_name: Dict[str, str] = {}
+    added = 0
+    for node in nodes:
+        key = f"{node['name']}@{node['version']}"
+        key_to_name[key] = node["name"]
+        if node["name"] in existing_names or key == root_key:
+            continue
+        packages.append(
+            DependencyNode(
+                name=node["name"],
+                version=node["version"],
+                ecosystem=ecosystem,
+                version_resolved=True,  # 服务端解析的精确版本
+            )
+        )
+        existing_names.add(node["name"])
+        added += 1
+    seen_pairs: set = {(e.source, e.target) for e in edges}
+    for e in dep_edges:
+        src = key_to_name.get(e["source"], e["source"].split("@")[0])
+        tgt = key_to_name.get(e["target"], e["target"].split("@")[0])
+        if (src, tgt) in seen_pairs or src == tgt:
+            continue
+        seen_pairs.add((src, tgt))
+        edges.append(DependencyEdge(source=src, target=tgt, constraint=e["constraint"]))
+    logger.info(
+        f"deps.dev 传递图增强: 新增 {added} 个传递依赖节点"
+    )
+
+
 def parse_dependencies(
     project_path: str,
 ) -> tuple[List[DependencyNode], List[DependencyEdge], str]:
@@ -2149,8 +2385,28 @@ def parse_dependencies(
     ecosystem = entry["ecosystem"]
 
     if not entry["parser"] or entry["parser"] not in PARSER_FUNCS:
-        # 检测可识别但 parser 未实现（注册表声明与实现不一致同样走这里）：
-        # 显式提示替代方案，不静默失败
+        # R10：优先最小本地解析 + deps.dev 服务端传递图增强，而非直接退出；
+        # manifest 无最小解析器时才退回显式提示
+        minimal = _MINIMAL_PARSERS.get(filename) or (
+            _MINIMAL_PARSERS.get(Path(filename).suffix.lower())
+        )
+        if minimal is not None:
+            logger.warning(
+                f"{filename} 无完整解析器，使用最小解析（约束下界近似）"
+                f"+ deps.dev 传递图增强"
+            )
+            try:
+                packages, edges, root_name, root_version = minimal(
+                    Path(dep_file), ecosystem
+                )
+            except Exception as e:
+                logger.error(f"最小解析 {filename} 失败: {e}")
+                sys.exit(EXIT_INPUT_ERROR)
+            if not packages:
+                logger.error("未找到依赖信息")
+                sys.exit(EXIT_INPUT_ERROR)
+            _depsdev_enrich(packages, edges, root_name, root_version, ecosystem)
+            return packages, edges, ecosystem
         logger.warning(
             f"已检测到 {filename}（ecosystem={ecosystem}，"
             f"{entry['kind']}），但自动解析器暂未实现。"
@@ -3500,6 +3756,32 @@ def cmd_security(args):
         else:
             print("\n✅ 未发现已知安全漏洞")
 
+        # deps.dev findings（R10，v3alpha 增强信号；失败静默跳过不阻断）
+        try:
+            import depsdev_client
+
+            dep_findings = depsdev_client.get_findings(
+                ecosystem, package_name, latest_version
+            )
+        except Exception:
+            dep_findings = None
+        if dep_findings:
+            print("\ndeps.dev findings（v3alpha 增强信号，实验 API）:")
+            for f in dep_findings:
+                if not isinstance(f, dict):
+                    continue
+                ftype = f.get("finding_type", "?")
+                if ftype == "REMEDIATION":
+                    rec = (f.get("remediation") or {}).get(
+                        "recommended_versions", []
+                    )
+                    print(
+                        f"  - REMEDIATION 推荐版本: {', '.join(rec) if rec else '-'}"
+                        "（可作 simulate 目标版本）"
+                    )
+                else:
+                    print(f"  - {ftype}")
+
         display_ignored_vulnerabilities(analyzer.ignored_vulnerabilities)
 
         # CI 门禁退出码：发现漏洞即按 --exit-code 指定的码退出（默认 0 兼容）
@@ -3680,6 +3962,35 @@ def cmd_health(args):
             names = ", ".join(x["package"] for x in policy["unknown"][:10])
             more = f" 等 {len(policy['unknown'])} 个" if len(policy["unknown"]) > 10 else ""
             print(f"    ⚠️ 无法校验{more}（license 未知，单列不算通过）: {names}")
+
+    # deps.dev Scorecard（R10，增强信号）：可选拉取，失败降级不阻断
+    if getattr(args, "scorecard", False):
+        import depsdev_client
+
+        scorecards = []
+        for pkg in packages:
+            if pkg.is_root or not pkg.version:
+                continue
+            sc = depsdev_client.get_scorecard(
+                pkg.ecosystem, pkg.name, pkg.version
+            )
+            if sc and isinstance(sc.get("scorecard"), dict):
+                score = sc["scorecard"].get("score")
+                scorecards.append(
+                    {
+                        "package": pkg.name,
+                        "version": pkg.version,
+                        "score": score,
+                    }
+                )
+        if scorecards:
+            result["scorecards"] = scorecards
+            print()
+            print("  OpenSSF Scorecard（deps.dev）:")
+            for s in scorecards:
+                print(f"    {s['package']}@{s['version']}: {s['score']}")
+        else:
+            print("\n⚠️ 未能获取任何 Scorecard 评分（deps.dev 不可达）")
 
     # 输出结果
     print()
@@ -4168,6 +4479,11 @@ def main():
         default=None,
         metavar="FILE",
         help="分类字典覆盖（YAML/JSON，扩充 permissive/weak_copyleft/copyleft）",
+    )
+    health_parser.add_argument(
+        "--scorecard",
+        action="store_true",
+        help="经 deps.dev 拉取各依赖的 OpenSSF Scorecard 评分（增强信号，需网络）",
     )
 
     # readme 命令
