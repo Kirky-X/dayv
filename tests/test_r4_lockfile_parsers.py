@@ -72,7 +72,8 @@ class TestPackageLock:
         tmp = _tmp_file("package-lock.json", json.dumps({"lockfileVersion": 1, "dependencies": {}}))
         with pytest.raises(SystemExit) as exc:
             da.parse_package_lock_json(str(tmp))
-        assert exc.value.code == 1
+        # R3 退出码契约：manifest/lockfile 解析失败 = 128
+        assert exc.value.code == da.EXIT_INPUT_ERROR
 
 
 # ============ poetry.lock ============

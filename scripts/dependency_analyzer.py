@@ -72,6 +72,12 @@ MAX_RECOMMENDATIONS_DISPLAY = 20
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_BATCH_CHUNK = 250  # OSV querybatch 上限 1000，保守分片
 
+# 退出码契约（R3，参照 osv-scanner 0/1/127/128 语义）：
+#   0   = 成功（含"未发现漏洞"）
+#   N   = --exit-code N 且发现漏洞（默认 0 保持兼容，不破坏既有调用方）
+#   128 = 输入/解析失败（manifest/lockfile/deps_data 缺失或格式非法）
+EXIT_INPUT_ERROR = 128
+
 # 内部 ecosystem 标识 → OSV ecosystem 名（单一来源：ecosystem_registry）
 OSV_ECOSYSTEM_MAP = {
     eco: meta["osv_ecosystem"] for eco, meta in eco_reg.ECOSYSTEMS.items()
@@ -1507,12 +1513,12 @@ def parse_pyproject_toml(
             import tomli as tomllib
         except ImportError:
             logger.error("需要安装 tomli 库: pip install tomli")
-            sys.exit(1)
+            sys.exit(EXIT_INPUT_ERROR)
 
     path_obj = Path(project_path)
     if not path_obj.exists():
         logger.error(f"找不到文件 {project_path}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     # 读取并解析 TOML 文件
     try:
@@ -1520,7 +1526,7 @@ def parse_pyproject_toml(
             data = tomllib.load(f)
     except Exception as e:
         logger.error(f"解析 TOML 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     # 提取项目名称
     project_info = data.get("project", {})
@@ -1591,14 +1597,14 @@ def parse_package_json(
     path_obj = Path(project_path)
     if not path_obj.exists():
         logger.error(f"找不到文件 {project_path}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     try:
         with path_obj.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     project_name = data.get("name", "unknown")
     project_version = data.get("version", "0.1.0")
@@ -1655,14 +1661,14 @@ def parse_requirements_txt(
     path_obj = Path(project_path)
     if not path_obj.exists():
         logger.error(f"找不到文件 {project_path}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     try:
         with path_obj.open("r", encoding="utf-8") as f:
             lines = f.readlines()
     except Exception as e:
         logger.error(f"读取文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     project_name = "unknown"
     packages = []
@@ -1723,7 +1729,7 @@ def parse_dependencies(
             ]
             logger.info(f"  {meta.get('display_name', eco)}({eco}): {', '.join(files)}")
         logger.info("注: Go 和 C/C++ 无中央 registry，不在支持列表")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     filename = Path(dep_file).name
 
@@ -1741,7 +1747,7 @@ def parse_dependencies(
             if e["parser"]
         ]
         logger.info(f"提示: 目前支持自动解析 {', '.join(supported)}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     ecosystem = entry["ecosystem"]
 
@@ -1756,7 +1762,7 @@ def parse_dependencies(
             f"请改用 query/search 子命令手动查询: "
             f"python dependency_analyzer.py query <pkg> -e {ecosystem}"
         )
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     parse_func = PARSER_FUNCS[entry["parser"]]
 
@@ -1765,7 +1771,7 @@ def parse_dependencies(
 
     if not packages:
         logger.error("未找到依赖信息")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     return packages, edges, ecosystem
 
@@ -1923,12 +1929,12 @@ def parse_package_lock_json(project_path: str):
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     all_entries = data.get("packages")
     if not isinstance(all_entries, dict):
         logger.error("package-lock.json 缺少 packages 字段（v1 格式请升级 lockfile 或改用 package.json）")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     root_entry = all_entries.get("", {}) or {}
     root_name = root_entry.get("name") or data.get("name") or "unknown"
@@ -2006,7 +2012,7 @@ def parse_poetry_lock(project_path: str):
             data = tomllib.load(f)
     except Exception as e:
         logger.error(f"解析 TOML 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     root_info = _lockfile_root_from_toml(path_obj, "pyproject.toml")
     root_name = root_info.get("name", "unknown")
@@ -2058,7 +2064,7 @@ def parse_cargo_lock(project_path: str):
             data = tomllib.load(f)
     except Exception as e:
         logger.error(f"解析 TOML 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     root_info = _lockfile_root_from_toml(path_obj, "Cargo.toml")
     root_name = root_info.get("name", "unknown")
@@ -2142,7 +2148,7 @@ def parse_composer_lock(project_path: str):
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     root_name = "unknown"
     root_constraints: Dict[str, str] = {}
@@ -2217,7 +2223,7 @@ def parse_gemfile_lock(project_path: str):
         lines = path_obj.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception as e:
         logger.error(f"读取文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     root_name = path_obj.parent.name or "unknown"
     packages = [
@@ -2316,7 +2322,7 @@ def cmd_analyze_data(args):
 
     if not data_path.exists():
         logger.error(f"找不到文件 {data_file}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     # 读取 JSON 数据
     try:
@@ -2324,12 +2330,12 @@ def cmd_analyze_data(args):
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     # 验证数据格式
     if "packages" not in data or "edges" not in data:
         logger.error("JSON 文件必须包含 'packages' 和 'edges' 字段")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     logger.info(f"正在分析依赖数据: {data_file}")
 
@@ -2340,6 +2346,9 @@ def cmd_analyze_data(args):
 
     # 创建分析器
     analyzer = DependencyAnalyzer()
+
+    # --exit-code 契约：任一执行分支发现的漏洞都计入退出判定
+    found_vulns: List[SecurityVulnerability] = []
 
     try:
         # 构建依赖图
@@ -2357,6 +2366,7 @@ def cmd_analyze_data(args):
         if args.security:
             vulns = analyzer.assess_security()
             display_vulnerabilities(vulns)
+            found_vulns = vulns
 
         if args.updates:
             update_paths = analyzer.plan_update_paths()
@@ -2366,6 +2376,7 @@ def cmd_analyze_data(args):
         if args.report:
             root_pkg = packages[0].name if packages else "unknown"
             report = analyzer.generate_report(root_pkg)
+            found_vulns = report.vulnerabilities
 
             output_file = args.output if args.output else "dependency_report.json"
             analyzer.export_report_json(report, output_file)
@@ -2379,6 +2390,7 @@ def cmd_analyze_data(args):
             conflicts = analyzer.detect_conflicts()
             recommendations = analyzer.recommend_optimal_versions()
             vulns = analyzer.assess_security()
+            found_vulns = vulns
             update_paths = analyzer.plan_update_paths()
 
             logger.info("分析摘要")
@@ -2403,6 +2415,14 @@ def cmd_analyze_data(args):
             analyzer.close()
         except Exception as e:
             logger.error(f"关闭分析器时出错: {e}")
+
+    # CI 门禁退出码：发现漏洞即按 --exit-code 指定的码退出（默认 0 不影响既有调用）
+    exit_code = getattr(args, "exit_code", 0) or 0
+    if exit_code and found_vulns:
+        logger.info(
+            f"--exit-code {exit_code}：发现 {len(found_vulns)} 个漏洞，按契约退出 {exit_code}"
+        )
+        sys.exit(exit_code)
 
 
 def enrich_licenses(
@@ -2855,6 +2875,12 @@ def cmd_security(args):
         else:
             print("\n✅ 未发现已知安全漏洞")
 
+        # CI 门禁退出码：发现漏洞即按 --exit-code 指定的码退出（默认 0 兼容）
+        exit_code = getattr(args, "exit_code", 0) or 0
+        if exit_code and vulns:
+            print(f"\n--exit-code {exit_code}：发现 {len(vulns)} 个漏洞，按契约退出")
+            sys.exit(exit_code)
+
     finally:
         analyzer.close()
 
@@ -2871,18 +2897,18 @@ def cmd_report(args):
     data_path = Path(data_file)
     if not data_path.exists():
         logger.error(f"找不到文件 {data_file}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     try:
         with data_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error(f"解析 JSON 文件失败: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     if "packages" not in data or "edges" not in data:
         logger.error("JSON 文件必须包含 'packages' 和 'edges' 字段")
-        sys.exit(1)
+        sys.exit(EXIT_INPUT_ERROR)
 
     # SBOM 格式：直接用 packages + edges 生成 SPDX（无需分析报告）
     if fmt == "sbom":
@@ -3235,6 +3261,13 @@ def main():
     analyze_parser.add_argument("--updates", action="store_true", help="只显示更新路径")
     analyze_parser.add_argument("--report", action="store_true", help="生成完整报告")
     analyze_parser.add_argument("-o", "--output", help="报告输出文件路径")
+    analyze_parser.add_argument(
+        "--exit-code",
+        type=int,
+        default=0,
+        metavar="N",
+        help="CI 门禁：发现漏洞时以 N 退出（默认 0 保持兼容；输入/解析失败恒为 128）",
+    )
 
     # analyze 命令（保留用于向后兼容）
     analyze_parser2 = subparsers.add_parser("analyze", help="分析项目依赖（旧版）")
@@ -3312,6 +3345,13 @@ def main():
         "--priority",
         action="store_true",
         help="按修复优先级排序（CVSS × 0.5 + exploit × 0.3 + business × 0.2）",
+    )
+    security_parser.add_argument(
+        "--exit-code",
+        type=int,
+        default=0,
+        metavar="N",
+        help="CI 门禁：发现漏洞时以 N 退出（默认 0 保持兼容；输入错误恒为 128）",
     )
 
     # report 命令
