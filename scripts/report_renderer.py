@@ -185,6 +185,32 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="empty-state">✅ 无漏洞</div>
     {% endif %}
 
+    {% if report.license_violations %}
+    <h2>许可证合规</h2>
+    <p>{{ report.license_violations|length }} 个依赖不在白名单，{{ (report.license_unknown or [])|length }} 个许可证未知（单列，不算通过）。</p>
+    <table class="sortable" id="license-table">
+        <thead>
+            <tr>
+                <th onclick="sortTable('license-table', 0)">包名</th>
+                <th onclick="sortTable('license-table', 1)">许可证</th>
+                <th onclick="sortTable('license-table', 2)">分类</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for v in report.license_violations %}
+            <tr>
+                <td>{{ v.package }}</td>
+                <td>{{ v.license }}</td>
+                <td><span class="tag tag-{{ 'high' if v.category == 'copyleft' else 'medium' }}">{{ v.category }}</span></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% if report.license_unknown %}
+    <div class="empty-state">⚠️ 无法校验（license 未知）: {% for u in report.license_unknown %}{{ u.package }}{% if not loop.last %}、{% endif %}{% endfor %}</div>
+    {% endif %}
+    {% endif %}
+
     <h2>版本推荐结果</h2>
     {% if report.update_paths %}
     <table class="sortable" id="updates-table">

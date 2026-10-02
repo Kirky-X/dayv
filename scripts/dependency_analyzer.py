@@ -3028,6 +3028,23 @@ def cmd_report(args):
     finally:
         analyzer.close()
 
+    # 许可证白名单策略（R8）：违规与 UNKNOWN 段并入报告 schema
+    allowed = getattr(args, "allowed_licenses", None)
+    if allowed:
+        import license_policy
+
+        custom = None
+        cat_file = getattr(args, "license_categories", None)
+        if cat_file:
+            custom = license_policy.load_custom_categories(cat_file)
+        policy = license_policy.evaluate_license_policy(
+            report_dict.get("license_info", []),
+            [x.strip() for x in allowed.split(",") if x.strip()],
+            custom=custom,
+        )
+        report_dict["license_violations"] = policy["license_violations"]
+        report_dict["license_unknown"] = policy["unknown"]
+
     # 默认输出文件名
     if output_file is None:
         output_file = "dependency_report.json"
@@ -3070,6 +3087,37 @@ def cmd_health(args):
     import health_scorer
 
     result = health_scorer.score_health(report_dict)
+
+    # 许可证白名单策略校验（R8）：违规与无法校验（UNKNOWN）显式单列
+    allowed = getattr(args, "allowed_licenses", None)
+    if allowed:
+        import license_policy
+
+        custom = None
+        cat_file = getattr(args, "license_categories", None)
+        if cat_file:
+            custom = license_policy.load_custom_categories(cat_file)
+        policy = license_policy.evaluate_license_policy(
+            report_dict.get("license_info", []),
+            [x.strip() for x in allowed.split(",") if x.strip()],
+            custom=custom,
+        )
+        result["license_policy"] = policy
+        print()
+        print(
+            "  许可证合规校验（白名单: " + ", ".join(policy["allowed"]) + "）:"
+        )
+        if policy["license_violations"]:
+            for v in policy["license_violations"]:
+                print(
+                    f"    ❌ {v['package']}: {v['license']}（{v['category']}）不在白名单"
+                )
+        else:
+            print("    ✅ 无违规依赖")
+        if policy["unknown"]:
+            names = ", ".join(x["package"] for x in policy["unknown"][:10])
+            more = f" 等 {len(policy['unknown'])} 个" if len(policy["unknown"]) > 10 else ""
+            print(f"    ⚠️ 无法校验{more}（license 未知，单列不算通过）: {names}")
 
     # 输出结果
     print()
@@ -3463,9 +3511,21 @@ def main():
     )
     report_parser.add_argument(
         "--format",
-        choices=["json", "html", "pdf", "sbom"],
+        choices=["json", "html", "pdf", "sarif", "cyclonedx", "sbom"],
         default="json",
         help="报告格式 (默认: json)",
+    )
+    report_parser.add_argument(
+        "--allowed-licenses",
+        default=None,
+        metavar="LIST",
+        help='许可证白名单（逗号分隔 SPDX id），违规/UNKNOWN 段并入报告 schema',
+    )
+    report_parser.add_argument(
+        "--license-categories",
+        default=None,
+        metavar="FILE",
+        help="分类字典覆盖（YAML/JSON）",
     )
 
     # health 命令
@@ -3475,6 +3535,19 @@ def main():
     health_parser.add_argument("project", help="项目路径或依赖文件路径")
     health_parser.add_argument(
         "-o", "--output", default=None, help="可选: 评分结果 JSON 输出路径"
+    )
+    health_parser.add_argument(
+        "--allowed-licenses",
+        default=None,
+        metavar="LIST",
+        help='许可证白名单（逗号分隔 SPDX id，如 "MIT,Apache-2.0"）；'
+        "违规与 UNKNOWN 分别显式列出",
+    )
+    health_parser.add_argument(
+        "--license-categories",
+        default=None,
+        metavar="FILE",
+        help="分类字典覆盖（YAML/JSON，扩充 permissive/weak_copyleft/copyleft）",
     )
 
     # readme 命令
