@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+import re
+
 import ecosystem_registry as eco_reg
 import purl as purl_mod
 
@@ -33,6 +35,12 @@ DEFAULT_SUPPLIER = "NOASSERTION"
 
 # 默认 LicenseConcluded（无许可证信息时）
 DEFAULT_LICENSE = "NOASSERTION"
+
+
+def safe_filename(name: str) -> str:
+    """project_name → 安全文件名分量（拦截 ../ 路径穿越，默认输出名专用）。"""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "-", name).strip(".") or "project"
+    return cleaned.replace("..", "-")
 
 
 # ============ 工具函数 ============
@@ -109,7 +117,9 @@ def generate_sbom(packages: List[Dict[str, Any]],
         if spdx_id in name_to_spdxid.values():
             spdx_id = _make_spdx_id(f"{name}-{version}")
 
-        name_to_spdxid[name] = spdx_id
+        if name not in name_to_spdxid:
+            # 首见版本保留映射：DESCRIBES/边指向首版，后续版本仅占位
+            name_to_spdxid[name] = spdx_id
 
         pkg_entry = {
             "Name": name,
@@ -204,7 +214,7 @@ def write_sbom(packages: List[Dict[str, Any]],
     sbom = generate_sbom(packages, edges, project_name)
 
     if output_path is None:
-        output_path = f"{project_name}-sbom.spdx.json"
+        output_path = f"{safe_filename(project_name)}-sbom.spdx.json"
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +269,12 @@ def generate_cyclonedx(packages: List[Dict[str, Any]],
         if purl_str:
             component["purl"] = purl_str
         if license_info and license_info.upper() not in ("UNKNOWN", "NOASSERTION"):
-            component["licenses"] = [{"license": {"id": license_info}}]
+            # SPDX 表达式（含 OR/AND/WITH/括号）必须走 expression 字段，
+            # id 只允许单个 SPDX license id（规范校验器会拒绝表达式写 id）
+            if re.search(r"\s+(?:OR|AND|WITH)\s+|\(", license_info):
+                component["licenses"] = [{"expression": license_info}]
+            else:
+                component["licenses"] = [{"license": {"id": license_info}}]
 
         if pkg.get("is_root") and not root_component:
             root_component = {**component, "type": "application"}
@@ -318,7 +333,7 @@ def write_cyclonedx(packages: List[Dict[str, Any]],
     """Generate CycloneDX SBOM and write a .cdx.json file (usable for re-scanning by trivy sbom / osv-scanner)."""
     cdx = generate_cyclonedx(packages, edges, project_name)
     if output_path is None:
-        output_path = f"{project_name}-sbom.cdx.json"
+        output_path = f"{safe_filename(project_name)}-sbom.cdx.json"
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as f:

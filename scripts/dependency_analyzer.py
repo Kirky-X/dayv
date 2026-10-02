@@ -1005,22 +1005,35 @@ class DependencyAnalyzer:
                     self._merge_chunk_results(
                         index, chunk_idx, chunk_results, results
                     )
-                    # 翻页：next_page_token 表示同一批查询还有更多漏洞
-                    page_token = data.get("next_page_token")
-                    while page_token:
-                        body = {"queries": chunk, "page_token": page_token}
-                        response = self._http.post(
-                            OSV_BATCH_URL, json=body, headers=headers
+                    # 翻页（OSV querybatch 规范）：next_page_token 在 results[i]
+                    # 内（顶层无此字段），重提交时放进对应 queries[i].page_token。
+                    # 单查询漏洞数超服务端单页上限时逐页取全，防止静默截断漏报。
+                    for j, k in enumerate(chunk_idx):
+                        pr = (
+                            chunk_results[j]
+                            if j < len(chunk_results) and isinstance(chunk_results[j], dict)
+                            else {}
                         )
-                        data = response.json()
-                        page_results = data.get("results", [])
-                        self._merge_chunk_results(
-                            index, chunk_idx, page_results, results, extend=True
-                        )
-                        page_token = data.get("next_page_token")
+                        token = pr.get("next_page_token")
+                        while token:
+                            body = {"queries": [dict(chunk[j], page_token=token)]}
+                            response = self._http.post(
+                                OSV_BATCH_URL, json=body, headers=headers
+                            )
+                            data = response.json()
+                            page_results = data.get("results", [])
+                            pr_page = (
+                                page_results[0]
+                                if page_results and isinstance(page_results[0], dict)
+                                else {}
+                            )
+                            results[k].setdefault("vulns", []).extend(
+                                pr_page.get("vulns", []) or []
+                            )
+                            token = pr_page.get("next_page_token")
 
                     if self.cache_ttl is not None:
-                        for j, k in enumerate(chunk_idx):
+                        for k in chunk_idx:
                             res = results[k]
                             osv_offline.cache_write(
                                 index[k].ecosystem,
@@ -1039,23 +1052,18 @@ class DependencyAnalyzer:
         chunk_idx: List[int],
         chunk_results: List[Any],
         results: List[Dict[str, Any]],
-        extend: bool = False,
     ) -> None:
-        """把 OSV 响应 results 与 chunk 的原 index 对齐合并。
+        """把 OSV 首页响应 results 与 chunk 的原 index 对齐合并。
 
-        - 首页：results[k] = chunk_results[j]
-        - 翻页（extend=True）：vulns 追加到既有条目
+        - results[k] = chunk_results[j]
         - 越界/非 dict 的响应位按 {} 处理（对齐缺口显性容忍，不猜测）
+        - 翻页在调用方按 result 级 next_page_token 逐包续拉
         """
         for j, k in enumerate(chunk_idx):
             pr = chunk_results[j] if j < len(chunk_results) else {}
             if not isinstance(pr, dict):
                 pr = {}
-            if extend:
-                base = results[k]
-                base.setdefault("vulns", []).extend(pr.get("vulns", []) or [])
-            else:
-                results[k] = pr
+            results[k] = pr
 
     def build_dependency_graph(
         self, packages: List[DependencyNode], dependencies: List[DependencyEdge]
@@ -1131,7 +1139,7 @@ class DependencyAnalyzer:
                         ],
                         conflict_type="version_mismatch",
                         severity=SeverityLevel.HIGH,
-                        suggestion=f"统一 {pkg_name} 的版本约束",
+                        suggestion=f"统一 {pkg_name} 的版本约束（按约束字符串比对，语义等价写法可能误报，请人工确认）",
                     )
                 )
 
@@ -1665,7 +1673,8 @@ def _extract_concrete_version(constraint: str) -> Optional[Tuple[str, bool]]:
     if op_match:
         operator = op_match.group(0)
         version = segment[op_match.end() :].strip()
-        inferred = operator not in ("=", "==")
+        # "=1.0"/"==1.0" 非 npm 精确锁定（≡ 1.0.x range），仅三段才算精确
+        inferred = operator not in ("=", "==") or not _EXACT_VERSION_RE.match(version)
     elif _NON_MEMBER_OP_RE.match(segment):
         # < / <= / != / > 的字面量不属于允许集合，送 OSV 会得出错误结论
         return None
@@ -1969,7 +1978,9 @@ def parse_requirements_txt(
 
     notes: List[str] = [
         "requirements.txt 为平铺直接依赖清单，不含传递依赖关系；"
-        "冲突检测仅覆盖跨文件/约束文件的直接声明交叉，'零冲突'不等于全图无冲突"
+        "冲突检测仅覆盖跨文件/约束文件的直接声明交叉，'零冲突'不等于全图无冲突",
+        "marker 条件（; python_version >= …）按当前运行 dayv 的解释器环境求值，"
+        "与目标项目实际安装环境可能不同",
     ]
 
     packages: List[DependencyNode] = [
@@ -2024,9 +2035,19 @@ def parse_requirements_txt(
                 if not con_path.is_file():
                     logger.warning(f"约束文件不存在（跳过）: {con_path}")
                     continue
-                for con_line in con_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    con_lines = con_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except Exception as e:
+                    logger.warning(f"约束文件读取失败（跳过）: {con_path}: {e}")
+                    continue
+                for con_line in con_lines:
                     con_line = con_line.strip()
-                    if not con_line or con_line.startswith(("#", "-")):
+                    if not con_line:
+                        continue
+                    if con_line.startswith("-"):
+                        skipped_options += 1  # 约束文件内的 -r/-c 嵌套指令不递归，显性计数
+                        continue
+                    if con_line.startswith("#"):
                         continue
                     cm = re.match(r"([A-Za-z0-9_.-]+)\s*(.*)", con_line)
                     if not cm:
@@ -2157,11 +2178,10 @@ def _parse_cargo_toml_minimal(path_obj: Path, ecosystem: str):
 
 def _parse_pom_xml_minimal(path_obj: Path, ecosystem: str):
     text = path_obj.read_text(encoding="utf-8", errors="replace")
-    block_re = re.compile(
-        r"<dependency>\s*<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>"
-        r"(?:\s*<version>([^<]+)</version>)?\s*</dependency>",
-        re.S,
-    )
+    # 两段式提取：先框出完整 <dependency> 块（容忍 scope/optional/exclusions
+    # 等子元素夹在中间），再块内逐字段提取——单正则严格相邻会整包漏检
+    block_re = re.compile(r"<dependency>(.*?)</dependency>", re.S)
+    field_re = re.compile(r"<(groupId|artifactId|version)>([^<]+)</\1>")
     first_group = re.search(r"<groupId>([^<]+)</groupId>", text)
     first_artifact = re.search(r"<artifactId>([^<]+)</artifactId>", text)
     root_name = (
@@ -2178,8 +2198,15 @@ def _parse_pom_xml_minimal(path_obj: Path, ecosystem: str):
     ]
     edges: List[DependencyEdge] = []
     seen: set = set()
+    blocks_total = 0
     for m in block_re.finditer(text):
-        g, a, v = m.group(1).strip(), m.group(2).strip(), (m.group(3) or "").strip()
+        blocks_total += 1
+        fields = dict(field_re.findall(m.group(1)))
+        g = (fields.get("groupId") or "").strip()
+        a = (fields.get("artifactId") or "").strip()
+        v = (fields.get("version") or "").strip()
+        if not g or not a:
+            continue  # 无坐标的 BOM/import 占位：解析不了，计数显性提示
         name = f"{g}:{a}"
         if name in seen:
             continue
@@ -2195,6 +2222,16 @@ def _parse_pom_xml_minimal(path_obj: Path, ecosystem: str):
             )
         )
         edges.append(DependencyEdge(source=root_name, target=name, constraint=constraint))
+    parsed_count = len(seen)
+    if blocks_total > parsed_count:
+        logger.warning(
+            f"pom.xml 检出 {blocks_total} 个 dependency 块，成功解析 {parsed_count} 个"
+            f"（缺 groupId/artifactId 的块跳过，显性告知）"
+        )
+        packages[0].properties.setdefault("manifest_notes", []).append(
+            f"pom.xml 检出 {blocks_total} 个 dependency 块，仅解析出 {parsed_count} 个"
+            f"（缺坐标的块未纳入分析）"
+        )
     return packages, edges, root_name, root_version
 
 
@@ -2324,10 +2361,14 @@ def _depsdev_enrich(
     existing_names = {p.name for p in packages}
     key_to_name: Dict[str, str] = {}
     added = 0
+    dup_dropped = 0
     for node in nodes:
         key = f"{node['name']}@{node['version']}"
         key_to_name[key] = node["name"]
-        if node["name"] in existing_names or key == root_key:
+        if key == root_key:
+            continue
+        if node["name"] in existing_names:
+            dup_dropped += 1  # 钻石依赖的另一版本：PK 语义只留首个，显性计数
             continue
         packages.append(
             DependencyNode(
@@ -2339,6 +2380,11 @@ def _depsdev_enrich(
         )
         existing_names.add(node["name"])
         added += 1
+    if dup_dropped:
+        packages[0].properties.setdefault("manifest_notes", []).append(
+            f"deps.dev 传递图含 {dup_dropped} 个同名多版本节点，"
+            f"漏洞扫描仅覆盖每包首个版本（钻石依赖的其余版本未扫描）"
+        )
     seen_pairs: set = {(e.source, e.target) for e in edges}
     for e in dep_edges:
         src = key_to_name.get(e["source"], e["source"].split("@")[0])
@@ -2607,7 +2653,7 @@ def _sbom_to_deps_data(path: Path) -> Dict[str, Any]:
         for pkg in data.get("Packages", []) or []:
             name = pkg.get("Name", "")
             version = str(pkg.get("VersionInfo", "") or "")
-            ecosystem = "pypi"
+            ecosystem = ""  # purl 解析失败留空 → OSV 查询按未映射生态显性跳过，不猜
             for ref in pkg.get("externalRefs", []) or []:
                 if ref.get("referenceType", "").lower() == "purl":
                     parsed = purl_mod.parse_purl(ref.get("referenceLocator", ""))
@@ -2657,7 +2703,7 @@ def _sbom_to_deps_data(path: Path) -> Dict[str, Any]:
         ref_to_entry: Dict[str, Dict[str, Any]] = {}
         for comp in data.get("components", []) or []:
             purl_str = comp.get("purl", "")
-            ecosystem = "pypi"
+            ecosystem = ""  # 无 purl/解析失败 → 未映射生态显性跳过，不假定 pypi
             name = comp.get("name", "")
             if purl_str:
                 parsed = purl_mod.parse_purl(purl_str)
@@ -2683,10 +2729,16 @@ def _sbom_to_deps_data(path: Path) -> Dict[str, Any]:
             }
             packages.append(entry)
             ref_to_entry[comp.get("bom-ref", "")] = entry
+        root_ecosystem = ""
+        root_purl = meta_component.get("purl", "")
+        if root_purl:
+            parsed = purl_mod.parse_purl(root_purl)
+            if parsed:
+                root_ecosystem = parsed["ecosystem"]
         root_entry = {
             "name": meta_component.get("name", "unknown"),
             "version": str(meta_component.get("version", "") or ""),
-            "ecosystem": "pypi",
+            "ecosystem": root_ecosystem,
             "is_root": True,
             "license": "",
             "version_resolved": bool(meta_component.get("version")),
@@ -2784,7 +2836,7 @@ def parse_package_lock_json(project_path: str):
 
     root_entry = all_entries.get("", {}) or {}
     root_name = root_entry.get("name") or data.get("name") or "unknown"
-    root_version = str(root_entry.get("version") or data.get("version") or "0.0.0")
+    root_version = str(root_entry.get("version") or data.get("version") or "")  # 缺失留空，不编造
     packages = [
         DependencyNode(
             name=root_name, version=root_version, ecosystem="npm", is_root=True
@@ -2793,6 +2845,7 @@ def parse_package_lock_json(project_path: str):
     edges: List[DependencyEdge] = []
 
     name_to_node: Dict[str, DependencyNode] = {}
+    dup_versions = 0
     for key, entry in all_entries.items():
         if key == "" or not isinstance(entry, dict):
             continue
@@ -2800,14 +2853,15 @@ def parse_package_lock_json(project_path: str):
         name = key.rsplit("node_modules/", 1)[-1]
         if not name or not entry.get("version"):
             continue
+        if name in name_to_node:
+            dup_versions += 1  # 同名嵌套多版本：首见为准（PK 语义），丢弃显性计数
+            continue
         node = DependencyNode(
             name=name,
             version=str(entry["version"]),
             ecosystem="npm",
             version_resolved=True,
         )
-        if name in name_to_node:
-            continue  # 同名嵌套：首见为准（PK 语义），不重复建节点
         name_to_node[name] = node
         packages.append(node)
 
@@ -2842,6 +2896,15 @@ def parse_package_lock_json(project_path: str):
                 inner_skipped += 1
     if inner_skipped:
         logger.info(f"package-lock 内部边跳过 {inner_skipped} 条（目标未出现在锁定清单）")
+    if dup_versions:
+        logger.warning(
+            f"package-lock 含 {dup_versions} 个同名多版本嵌套条目，"
+            f"仅扫描每包首个版本（其余不进漏洞扫描，显性告知）"
+        )
+        packages[0].properties.setdefault("manifest_notes", []).append(
+            f"package-lock.json 含 {dup_versions} 个同名多版本嵌套条目，"
+            f"漏洞扫描仅覆盖每包首个锁定版本"
+        )
 
     return packages, edges
 
@@ -2862,10 +2925,11 @@ def parse_poetry_lock(project_path: str):
 
     root_info = _lockfile_root_from_toml(path_obj, "pyproject.toml")
     root_name = root_info.get("name", "unknown")
+    root_version = root_info.get("version", "")
     packages = [
         DependencyNode(
             name=root_name,
-            version=root_info.get("version", "0.0.0"),
+            version=root_version,
             ecosystem="pypi",
             is_root=True,
         )
@@ -2874,11 +2938,13 @@ def parse_poetry_lock(project_path: str):
     constraints = _manifest_constraints(path_obj, "pyproject.toml")
     edges: List[DependencyEdge] = []
     seen: set = set()
+    dup_versions = 0
     for pkg in data.get("package", []) or []:
         if not isinstance(pkg, dict) or not pkg.get("name") or not pkg.get("version"):
             continue
         name = str(pkg["name"]).lower()
         if name in seen:
+            dup_versions += 1
             continue
         seen.add(name)
         packages.append(
@@ -2895,6 +2961,11 @@ def parse_poetry_lock(project_path: str):
                     source=root_name, target=name, constraint=constraints[name]
                 )
             )
+    if dup_versions:
+        logger.warning(f"poetry.lock 含 {dup_versions} 个同名重复条目，仅扫描首个版本")
+        packages[0].properties.setdefault("manifest_notes", []).append(
+            f"poetry.lock 含 {dup_versions} 个同名重复条目，漏洞扫描仅覆盖首个锁定版本"
+        )
     return packages, edges
 
 
@@ -2917,7 +2988,7 @@ def parse_cargo_lock(project_path: str):
     packages = [
         DependencyNode(
             name=root_name,
-            version=root_info.get("version", "0.0.0"),
+            version=root_info.get("version", ""),
             ecosystem="crates",
             is_root=True,
         )
@@ -2945,11 +3016,13 @@ def parse_cargo_lock(project_path: str):
             logger.warning(f"解析 Cargo.toml 依赖约束失败（跳过根约束边）: {e}")
 
     name_to_node: Dict[str, DependencyNode] = {}
+    dup_versions = 0
     for pkg in data.get("package", []) or []:
         if not isinstance(pkg, dict) or not pkg.get("name") or not pkg.get("version"):
             continue
         name = str(pkg["name"])
         if name in name_to_node:
+            dup_versions += 1
             continue
         node = DependencyNode(
             name=name,
@@ -2967,6 +3040,15 @@ def parse_cargo_lock(project_path: str):
                     constraint=root_constraints[name],
                 )
             )
+
+    if dup_versions:
+        logger.warning(
+            f"Cargo.lock 含 {dup_versions} 个同名多版本条目，仅扫描每包首个版本"
+        )
+        packages[0].properties.setdefault("manifest_notes", []).append(
+            f"Cargo.lock 含 {dup_versions} 个同名多版本条目，"
+            f"漏洞扫描仅覆盖每包首个锁定版本"
+        )
 
     # 内部依赖边："cfg-if 1.0.0"（同名多版本消歧）或 "getrandom"
     for pkg in data.get("package", []) or []:
@@ -3084,6 +3166,7 @@ def parse_gemfile_lock(project_path: str):
     section = ""
     in_specs = False
     current_spec: Optional[str] = None
+    ignored_git_path_specs = 0
     # specs 按字母序排列，依赖约束行可能先于目标 spec 行出现——先收集后建边
     pending_inner: List[tuple] = []  # (source, target, constraint)
     for line in lines:
@@ -3102,6 +3185,8 @@ def parse_gemfile_lock(project_path: str):
                 continue
             if not in_specs:
                 continue  # remote: 等 GEM 段元数据行
+            if section != "GEM":
+                ignored_git_path_specs += 1  # GIT/PATH 段的 gem 不进扫描，显性计数
             m = re.match(r"^([^\s(]+)(?: \(([^)]+)\))?$", stripped)
             if not m:
                 continue
@@ -3144,6 +3229,14 @@ def parse_gemfile_lock(project_path: str):
     if skipped_inner:
         logger.info(
             f"Gemfile.lock 内部边跳过 {skipped_inner} 条（目标未出现在锁定 specs 清单）"
+        )
+    if ignored_git_path_specs:
+        logger.warning(
+            f"Gemfile.lock 含 {ignored_git_path_specs} 个 GIT/PATH source 的 gem，"
+            f"未纳入漏洞扫描（无 registry 版本可比对，显性告知）"
+        )
+        packages[0].properties.setdefault("manifest_notes", []).append(
+            f"Gemfile.lock 含 {ignored_git_path_specs} 个 GIT/PATH source 的 gem，未纳入漏洞扫描"
         )
     return packages, edges
 
@@ -3348,7 +3441,10 @@ def cmd_analyze_data(args):
                 found_vulns = [
                     v
                     for v in found_vulns
-                    if f"{v.package}:vulnerability:{v.cve_id}" not in known_vuln_keys
+                    if vb.violation_key(
+                        {"package": v.package, "cve_id": v.cve_id}
+                    )
+                    not in known_vuln_keys
                 ]
 
     finally:
@@ -3700,6 +3796,17 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def _exit_code_arg(value: str) -> int:
+    """--exit-code 参数校验：0-255 之外的值会让 POSIX sys.exit 截断失真。"""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--exit-code 需为整数: {value!r}")
+    if not 0 <= n <= 255:
+        raise argparse.ArgumentTypeError(f"--exit-code 须在 0-255 范围内: {n}")
+    return n
+
+
 def _security_deps_data(
     package_name: str, version: str, ecosystem: str
 ) -> Dict[str, Any]:
@@ -3858,7 +3965,8 @@ def cmd_security(args):
             dep_findings = depsdev_client.get_findings(
                 ecosystem, package_name, latest_version
             )
-        except Exception:
+        except Exception as e:
+            logger.warning(f"deps.dev findings 拉取失败（跳过增强信号）: {e}")
             dep_findings = None
         if dep_findings:
             print("\ndeps.dev findings（v3alpha 增强信号，实验 API）:")
@@ -3920,7 +4028,7 @@ def cmd_report(args):
 
         project_name = data["packages"][0]["name"] if data["packages"] else "unknown"
         if output_file is None:
-            output_file = f"{project_name}-sbom.cdx.json"
+            output_file = f"{sbom_generator.safe_filename(project_name)}-sbom.cdx.json"
         try:
             result_path = sbom_generator.write_cyclonedx(
                 packages=data["packages"],
@@ -3940,7 +4048,7 @@ def cmd_report(args):
 
         project_name = data["packages"][0]["name"] if data["packages"] else "unknown"
         if output_file is None:
-            output_file = f"{project_name}-sbom.spdx.json"
+            output_file = f"{sbom_generator.safe_filename(project_name)}-sbom.spdx.json"
         try:
             result_path = sbom_generator.write_sbom(
                 packages=data["packages"],
@@ -4403,10 +4511,10 @@ def main():
     analyze_parser.add_argument("-o", "--output", help="报告输出文件路径")
     analyze_parser.add_argument(
         "--exit-code",
-        type=int,
+        type=_exit_code_arg,
         default=0,
         metavar="N",
-        help="CI 门禁：发现漏洞时以 N 退出（默认 0 保持兼容；输入/解析失败恒为 128）",
+        help="CI 门禁：发现漏洞时以 N 退出（0-255；默认 0 保持兼容；输入/解析失败恒为 128）",
     )
     analyze_parser.add_argument(
         "--config",
@@ -4516,10 +4624,10 @@ def main():
     )
     security_parser.add_argument(
         "--exit-code",
-        type=int,
+        type=_exit_code_arg,
         default=0,
         metavar="N",
-        help="CI 门禁：发现漏洞时以 N 退出（默认 0 保持兼容；输入错误恒为 128）",
+        help="CI 门禁：发现漏洞时以 N 退出（0-255；默认 0 保持兼容；输入错误恒为 128）",
     )
     security_parser.add_argument(
         "--config",

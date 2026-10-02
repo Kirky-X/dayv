@@ -121,3 +121,104 @@ flowchart TD
     SECURITY --> MON["monitor 持续监控"]
     REPORT --> OUT["json/html/pdf/sbom 输出"]
 ```
+
+## 新增能力（v0.1.1，对标调研 15 条建议落地）
+
+### CI 退出码契约
+
+| 退出码 | 含义 |
+|--------|------|
+| `0` | 成功（含"未发现漏洞"） |
+| `N` | `--exit-code N` 且发现漏洞（默认 0 保持兼容） |
+| `128` | 输入/解析失败（manifest/lockfile/deps_data 缺失或格式非法） |
+
+固定严重级映射，不用"退出码=违规数"（>255 溢出）。`--ignore-known` 基线命中
+的已知漏洞不计入退出判定（只对新增违规 fail）。
+
+### lockfile 解析（精确版本优先）
+
+`package-lock.json` (v2/v3) / `poetry.lock` / `Cargo.lock` / `composer.lock` /
+`Gemfile.lock`：命中时优先于 manifest，节点标 `version_resolved=True` 且
+`version_inferred=False`（OSV 受影响判定不再保守近似）。根节点来自同目录
+manifest，根约束边 + lockfile 内部依赖边均产出。
+
+### SBOM 双标准 + 反向输入
+
+```bash
+# SPDX 2.3（带 purl externalRefs，可被 osv-scanner --sbom / trivy sbom 复扫）
+python scripts/dependency_analyzer.py report deps_data.json --format sbom
+# CycloneDX 1.5
+python scripts/dependency_analyzer.py report deps_data.json --format cyclonedx
+# SARIF 2.1.0（github/codeql-action/upload-sarif 直连 GitHub Security 页）
+python scripts/dependency_analyzer.py report deps_data.json --format sarif
+# SBOM 反向作为输入（消费 syft / osv-scanner 产物）
+python scripts/dependency_analyzer.py analyze-data --from-sbom sbom.cdx.json --security
+```
+
+### 豁免清单（.dayv.toml）
+
+```toml
+[[ignored_vulns]]
+id = "GHSA-xxxx-xxxx-xxxx"   # CVE/OSV/GHSA id，OSV alias 连带命中
+reason = "dev 依赖不可达"      # 必填
+ignore_until = "2026-12-31"  # 可选；过期自动恢复告警
+```
+
+security / monitor / analyze-data（`--config` 显式或 `.dayv.toml` 三级目录自动
+探测）生效。被豁免漏洞**不静默消失**：报告 `ignored_vulnerabilities` 段逐条
+列出理由与过期日。`[[package_overrides]]` 语义未定义，解析到即显式报错。
+
+### 许可证白名单合规
+
+```bash
+python scripts/dependency_analyzer.py health /path/to/project --allowed-licenses "MIT,Apache-2.0"
+python scripts/dependency_analyzer.py report deps_data.json --format json --allowed-licenses "MIT" -o r.json
+```
+
+内置宽松/弱 Copyleft/Copyleft 分类（`--license-categories` YAML/JSON 覆盖扩充）；
+表达式 `MIT OR GPL-2.0` 任一分支命中即合规；UNKNOWN 单列"无法校验"不算通过；
+违规段写入报告 `license_violations` / `license_unknown`（HTML 模板含许可证合规章节）。
+
+### OSV 离线库 + TTL 缓存
+
+```bash
+python scripts/dependency_analyzer.py security requests --download-offline-db  # 下载该生态离线库
+python scripts/dependency_analyzer.py security requests --offline              # 只查本地库
+python scripts/dependency_analyzer.py analyze-data deps_data.json --security --cache  # TTL 缓存
+```
+
+离线库：`~/.dayv/osv_db/<eco>/`（meta.json 记录下载时间）；未下载生态的包显性
+进入 scan_warnings（未扫描≠无漏洞）。复杂受影响区间（last_affected/limit/GIT）
+保守跳过并分桶计数。缓存：`~/.dayv/cache/`，TTL 24h；**防误报例外**——任一包
+版本为范围约束推断时整批 TTL 收敛 ≤5 分钟。
+
+### 声明式规则引擎 + 违规基线
+
+```bash
+python scripts/dependency_analyzer.py analyze-data deps_data.json \
+  --rules .dayv/rules.json --baseline .dayv-known-violations.json   # 首扫写基线
+python scripts/dependency_analyzer.py analyze-data deps_data.json \
+  --rules .dayv/rules.json --ignore-known .dayv-known-violations.json --exit-code 1
+```
+
+规则 schema 与六类场景配方见 [`rules-recipes.md`](./rules-recipes.md)。
+`--baseline` 首次写基线；旧基线条目在新扫描中消失时显性提示（可能已修复，
+防基线沦为永久豁免）；`--ignore-known` 命中基线的违规单独列出。
+
+### deps.dev 集成（增强信号）
+
+- 命中无完整解析器的 manifest（Cargo.toml/pom.xml/Gemfile/composer.json/*.csproj）
+  时最小本地解析先行，maven/crates 叠加 deps.dev GetDependencies 服务端传递图；
+  不可达时降级为直接依赖近似并在 scan_warnings 显性标注
+- `security` 叠加 v3alpha findings（MALICIOUS/DEPRECATED/COOLDOWN/LOW_USAGE/
+  REMEDIATION；REMEDIATION 推荐版本可作 simulate 目标）
+- `health --scorecard` 拉取 OpenSSF Scorecard（结果 JSON 含 `scorecards` 键，
+  不改变 5 维 schema）；失败降级不阻断
+
+### 其他
+
+- `analyze --list-parsers`：各生态解析能力自省表（implemented/partial/not_implemented）
+- 生态 registry 基址可用 `DAYV_INDEX_URL_<ECO>` 环境变量覆盖（企业私仓）
+- `health`：弃用包（npm deprecated / crates yanked）计入维护维度扣分（每个
+  -10，封顶 -30），报告新增 `deprecated_packages` 段
+- optimize `--apply`：实际修改配置文件移除 unused 依赖（自动写 `.dayv.bak` 备份）

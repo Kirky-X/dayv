@@ -11,6 +11,7 @@ purl 规范: https://github.com/package-url/purl-spec
 """
 
 import logging
+import re
 from typing import Any, Dict, Optional
 from urllib.parse import quote, unquote
 
@@ -74,6 +75,8 @@ def parse_purl(purl: str) -> Optional[Dict[str, Any]]:
     if not isinstance(purl, str) or not purl.startswith("pkg:"):
         return None
     rest = purl[4:]
+    # qualifiers(?…) 与 subpath(#…) 不属于 version，先剥离防污染
+    rest = re.split(r"[?#]", rest, maxsplit=1)[0]
     version = None
     if "@" in rest:
         rest, _, raw_version = rest.rpartition("@")

@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 V3_BASE = "https://api.deps.dev/v3"
 V3ALPHA_BASE = "https://api.deps.dev/v3alpha"
 
-# GetDependencies 服务端解析的生态覆盖（deps.dev api.proto；packagist/rubygems/
-# nuget 不在列，用 GetRequirements 本地合并约束）
+# GetDependencies 服务端解析的生态覆盖（deps.dev api.proto）。
+# packagist/rubygems/nuget 不在覆盖内：这些生态走本地最小解析近似（直接依赖），
+# GetRequirements 当前未接入解析链路（预留接口，供后续实现约束合并）。
 DEPENDENCIES_ECOS = {"npm", "crates", "maven", "pypi"}
 
 # GetFindings 的 finding_type 枚举（v3alpha）
@@ -93,7 +94,7 @@ def get_requirements(
     version: str,
     http_get: Optional[Callable[[str], dict]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """7 生态未解析依赖约束（GetRequirements 全覆盖，弥补 GetDependencies 错位）。"""
+    """7 生态未解析依赖约束（预留接口：当前解析链路未接入，不参与传递图增强）。"""
     system = _system(ecosystem)
     if not system:
         return None

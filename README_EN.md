@@ -13,27 +13,31 @@ English | [中文](README.md)
 
 | Subcommand | Description | Key flags |
 | ------ | ---- | --------- |
-| `analyze-data` | Analyzes dependency-data JSON provided by the LLM (main entry) | `--conflicts` / `--security` / `--report` / `-o` |
-| `analyze` | Analyzes project dependencies (legacy) | `--visualize` (Mermaid) / `--impact` |
+| `analyze-data` | Analyzes dependency-data JSON provided by the LLM (main entry) | `--conflicts` / `--security` / `--report` / `--rules` / `--baseline` / `--ignore-known` / `--from-sbom` / `--exit-code N` |
+| `analyze` | Analyzes project dependencies (lockfile-first) | `--visualize` (Mermaid) / `--impact` / `--list-parsers` |
 | `query` | Queries a package's upstream/downstream dependencies | `-e <ecosystem>` |
 | `search` | Searches packages by keyword | `-e <ecosystem>` |
-| `security` | Scans packages for security vulnerabilities (OSV) | `-e` / `--priority` (CVSS×0.5+exploit×0.3+business×0.2) |
-| `report` | Generates reports from `deps_data.json` | `--format json\|html\|pdf\|sbom` |
-| `health` | 5-dimension health scoring + Mermaid radar chart | `-o` |
+| `security` | Scans packages for security vulnerabilities (OSV) | `-e` / `--priority` / `--exit-code N` / `--offline` / `--download-offline-db` / `--config` |
+| `report` | Generates reports from `deps_data.json` | `--format json\|html\|pdf\|sarif\|cyclonedx\|sbom` / `--allowed-licenses` |
+| `health` | 5-dimension health scoring + Mermaid radar chart | `-o` / `--allowed-licenses` / `--license-categories` / `--scorecard` |
 | `readme` | Generates a dependency-notes markdown section | `-o` |
 | `simulate` | Upgrade-impact dry-run (major=high / minor=medium / patch=low) | `--project` |
-| `monitor` | Scheduled vulnerability scans + webhook alerting | `--cron` / `--webhook` |
-| `optimize` | Dependency-config optimization (dedupe + remove redundancy + detect unused) | `--check dedupe\|redundant\|unused` / `--deep` |
+| `monitor` | Scheduled vulnerability scans + webhook alerting | `--cron` / `--webhook` / `--offline` / `--cache` |
+| `optimize` | Dependency-config optimization (dedupe + remove redundancy + detect unused) | `--check dedupe\|redundant\|unused` / `--deep` / `--apply` |
+
+**CI exit-code contract**: `0` = success; `N` = `--exit-code N` and vulnerabilities found; `128` = input/parse failure.
 
 **7 ecosystems**: Python(PyPI) / Node.js(npm) / Java(Maven) / Rust(crates) / Ruby(RubyGems) / PHP(Packagist) / .NET(NuGet). `security`/`query`/`search` all support `-e` to specify the ecosystem.
 
-**Core mechanics**: Ladybug GraphDB builds the `Package` / `DependsOn` / `ConflictsWith` / `Vulnerability` graph; vulnerability scanning goes through [OSV](https://osv.dev/) (CVE/GHSA + severity + fixed versions); version recommendations must pass `check_version_constraint` validation; when multiple ecosystem config types are detected coexisting in one directory, the effective/skipped list is shown explicitly and the scan scope is asked for — never silently narrowed.
+**Core mechanics**: Ladybug GraphDB builds the `Package` / `DependsOn` / `ConflictsWith` / `Vulnerability` graph; vulnerability scanning goes through [OSV](https://osv.dev/) (CVE/GHSA + severity + fixed versions, purl-only query contract); version recommendations must pass `check_version_constraint` validation; lockfiles take precedence over manifests (exact versions eliminate range lower-bound approximations); when multiple ecosystem config types coexist in one directory, the effective/skipped list is shown explicitly — never silently narrowed.
+
+**Governance capabilities**: vulnerability exemption list (`.dayv.toml`, with expiry dates and alias chaining, listed explicitly in reports), license whitelist compliance (`--allowed-licenses`, UNKNOWN bucketed separately), declarative rule engine (`.dayv/rules.json`, forbidden/allowed/required), violation baseline (`--baseline`/`--ignore-known` fail only on new violations), OSV offline DB + TTL cache, dual-standard SBOM (SPDX + CycloneDX with purl throughout, rescannable by osv-scanner/trivy), SARIF 2.1.0 for the GitHub Security tab, and deps.dev transitive-graph enrichment (minimal-parse fallback for ecosystems without full parsers).
 
 ## 📦 Installation
 
 ```bash
-# 同步到 agent 技能目录（~/.zcode/skills 与 ~/.claude/skills）
-bash scripts/sync-skills.sh dayv
+# Sync into the agent skill directories (run from the skills workspace root; the script is not in this repo)
+bash ../scripts/sync-skills.sh dayv   # or the repo-root install-skill.sh
 
 # 首跑前置：安装依赖（缺依赖时子命令会显式报错提示本步骤，不会裸 traceback 崩溃）
 pip install -r requirements.txt
@@ -66,9 +70,9 @@ python scripts/dependency_analyzer.py optimize /path/to/project --check unused
 
 ## ✅ Tests & Verification
 
-- **Syntax**: `python3 -m py_compile scripts/*.py` measured — all 20 scripts pass
+- **Syntax**: `python3 -m py_compile scripts/*.py` measured — all 29 scripts pass
 - **End-to-end measurement**: feeding the sample `deps_data.json` (numpy 1.21.0 + pandas/scipy edges) into `analyze-data` → produces `report.json`, with an OSV live hit `GHSA-fpfv-jqm9-f5jm` (numpy 1.21.0, medium); `report --format html` measured to produce a 7.2KB HTML file
-- **Regression-test directory not tracked in git**: pytest cannot run directly after cloning (only `conftest.py` remains at the repo root); verification relies on actually running each subcommand plus checking `--help` output
+- **Regression tests**: `tests/` is tracked in git — run `python -m pytest tests/ -q` directly after cloning (fully offline with mocks, no network); additionally `python3 scripts/skill_lint.py .` gates doc consistency (SKILL.md subcommand table vs CLI --help)
 - **Known gray zone (reported honestly)**: PyPI has no official search API, so `search`/`query` parse scraped pypi.org HTML pages (BeautifulSoup); page markup changes may cause fields to parse as empty — in one measured `query fastapi` run, `versions` returned normally while `latest_version` came back empty; when `security` cannot parse the latest version it refuses to run by design (to prevent false positives from fake versions) — in that case, use `analyze-data` and let the LLM supply version data
 
 ## 📁 Directory Structure
@@ -77,16 +81,21 @@ python scripts/dependency_analyzer.py optimize /path/to/project --check unused
 dayv/
 ├── SKILL.md                  # 入口：子命令决策树 + 工作流 + 红线
 ├── requirements.txt          # real-ladybug/httpx/jinja2 等
-├── conftest.py               # pytest 配置（测试目录未入 git）
+├── conftest.py               # pytest 配置
+├── tests/                    # offline regression tests (doc-consistency gate included)
 ├── references/               # subcommands / architecture / anti-patterns 文档
-└── scripts/
-    ├── dependency_analyzer.py    # 主分析引擎（11 子命令入口）
-    ├── base_ecosystem.py         # 7 生态共享 adapter（fetch→parse 统一 schema）
-    ├── report_renderer.py        # JSON/HTML/PDF 渲染
-    ├── sbom_generator.py         # SPDX 2.3 SBOM
-    ├── health_scorer.py          # 5 维度健康度 + 雷达图
-    ├── dependency_optimizer.py   # 去重/删冗余/识别未使用
-    ├── monitor.py / simulator.py / impact_analyzer.py / visualizer.py / ...
+├── lint-checks.json          # skill_lint self-check rules (cli-subcommands doc gate)
+└── scripts/                  # 29 scripts (single-file, self-contained, pure Python)
+    ├── dependency_analyzer.py    # main engine (11 subcommands)
+    ├── ecosystem_registry.py     # single-source ecosystem metadata registry
+    ├── base_ecosystem.py         # shared 7-ecosystem adapter (fetch→parse unified schema)
+    ├── purl.py                   # Package URL single-point build/parse
+    ├── report_renderer.py        # JSON/HTML/PDF/SARIF rendering
+    ├── sbom_generator.py         # SPDX 2.3 + CycloneDX 1.5 SBOM
+    ├── health_scorer.py          # 5-dimension health scoring + radar chart
+    ├── dependency_optimizer.py   # dedupe / redundancy / unused detection
+    ├── exemptions.py / license_policy.py / osv_offline.py / rule_engine.py
+    ├── violation_baseline.py / depsdev_client.py / monitor.py / simulator.py / ...
     └── pypi.py / npm.py / maven.py / crates.py / rubygems.py / packagist.py / nuget.py
 ```
 

@@ -195,7 +195,7 @@ def evaluate_rules(
         )
 
     active_rules = [r for r in rules if r.get("severity") != "ignore"]
-    has_allowed = any(r["type"] == "allowed" for r in active_rules)
+    allowed_rules = [r for r in active_rules if r["type"] == "allowed"]
 
     for rule in active_rules:
         rtype = rule["type"]
@@ -223,11 +223,17 @@ def evaluate_rules(
                     if _rule_matches_package(rule, pkg):
                         _violation(rule, pkg.get("name", "?"), rule.get("message", ""))
         elif rtype == "allowed":
+            # 白名单违规只按首条 allowed 规则名义报一次（多条 allowed 规则
+            # 是"白名单的多个侧面"，不是多个独立违规来源）
+            if rule is not allowed_rules[0]:
+                continue
             for pkg in enriched:
                 if "license" in rule and not (pkg.get("license") or ""):
                     # 许可证缺失：无法判定白名单，不判违规（UNKNOWN 单列语义）
                     continue
-                if not any(_rule_matches_package(r, pkg) for r in active_rules if r["type"] == "allowed"):
+                if not any(
+                    _rule_matches_package(r, pkg) for r in allowed_rules
+                ):
                     _violation(
                         rule,
                         pkg.get("name", "?"),

@@ -2,7 +2,7 @@
   "name": "dayv",
   "description": "依赖分析引擎（PyPI/npm/Maven 等 7 生态系统）。分析依赖树/冲突/漏洞，生成 HTML/PDF/SBOM/健康度，或优化依赖配置（去重/删冗余/识别未使用）。触发：dependency、依赖树、版本冲突、安全漏洞、package.json、pyproject.toml、Cargo.toml、SBOM、健康度、优化依赖",
   "license": "MIT",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Kirky-X",
   "repo": "https://github.com/Kirky-X/dayv",
   "homepage": "https://github.com/Kirky-X/dayv",

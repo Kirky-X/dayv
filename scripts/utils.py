@@ -396,8 +396,11 @@ def check_version_constraint(version: str, constraint: str) -> bool:
         if _HYPHEN_SPLIT_RE.search(constraint):
             left, right = _HYPHEN_SPLIT_RE.split(constraint, maxsplit=1)
             lower = semver.Version.parse(_pad_semver(clean_version_string(left.strip())))
+            # 右侧通配段（"2.x" ≡ "2"）先剥离再按缺段语义判
             right_clean = clean_version_string(right.strip())
-            segs = right_clean.split(".")
+            segs = [s for s in right_clean.split(".") if s not in ("x", "X", "*")]
+            if not segs:
+                return ver >= lower  # 上界全通配 = 无上界
             if len(segs) == 1:
                 return ver >= lower and ver < semver.Version.parse(
                     f"{int(segs[0]) + 1}.0.0"

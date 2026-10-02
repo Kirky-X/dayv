@@ -1,0 +1,27 @@
+{
+  "checks": [
+    {
+      "name": "SKILL.md 子命令表与 dependency_analyzer --help 一致",
+      "type": "cli-subcommands",
+      "cli": "scripts/dependency_analyzer.py",
+      "doc": "SKILL.md",
+      "severity": "FAIL"
+    },
+    {
+      "name": "analyze-data 主入口必须记载于 SKILL.md",
+      "type": "require-pattern",
+      "file": "SKILL.md",
+      "pattern": "analyze-data",
+      "min_count": 1,
+      "severity": "FAIL"
+    },
+    {
+      "name": "optimize --apply 必须记载于 SKILL.md",
+      "type": "require-pattern",
+      "file": "SKILL.md",
+      "pattern": "--apply",
+      "min_count": 1,
+      "severity": "FAIL"
+    }
+  ]
+}

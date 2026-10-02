@@ -12,7 +12,10 @@
         frontmatter metadata 与 skill.json version 一致；
         SKILL.md 与 references/**/*.md 中引用的 .md 路径存在；
         可选 lint-checks.json 声明的仓内自检规则未满足（require-pattern /
-        file-header 两类，按仓 opt-in；配置本身非法同样 FAIL）。
+        file-header / cli-subcommands 三类，按仓 opt-in；配置本身非法同样
+        FAIL）。cli-subcommands：运行 cli 的 --help 取实际子命令集合，断言
+        每个实际子命令以反引号形式出现在 doc 中，且 doc 的子命令表（行首
+        | `cmd` | 形态）不列出不存在的命令——文档与 CLI 行为一致性门禁。
   WARN  frontmatter metadata 缺失（agentskills 规范）；SKILL.md >500 行；
         scripts/ 有可执行脚本但无 tests/；references 孤儿文件；LICENSE 缺失。
 
@@ -152,12 +155,12 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
         if not isinstance(rule, dict):
             fails.append(f"{name}: {where} 不是对象")
             continue
-        unknown = set(rule) - {"name", "type", "file", "pattern", "min_count", "dirs", "fields", "severity"}
+        unknown = set(rule) - {"name", "type", "file", "pattern", "min_count", "dirs", "fields", "severity", "cli", "doc"}
         if unknown:
             fails.append(f"{name}: {where} 未知键: {sorted(unknown)}")
             continue
         rtype = rule.get("type", "require-pattern")
-        if rtype not in ("require-pattern", "file-header"):
+        if rtype not in ("require-pattern", "file-header", "cli-subcommands"):
             fails.append(f"{name}: {where} 未知 type: {rtype!r}")
             continue
         sev = rule.get("severity", "FAIL")
@@ -186,6 +189,57 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
             if found < min_count:
                 bucket = fails if sev == "FAIL" else warns
                 bucket.append(f"{name}: {rname} 未满足（{rel} 命中 {found}/{min_count}）")
+        elif rtype == "cli-subcommands":
+            cli_rel, doc_rel = rule.get("cli"), rule.get("doc")
+            if not cli_rel or not doc_rel:
+                fails.append(f"{name}: {where} cli-subcommands 需要 cli 与 doc")
+                continue
+            cli_path, doc_path = repo / cli_rel, repo / doc_rel
+            if not cli_path.is_file() or not doc_path.is_file():
+                fails.append(f"{name}: {where} cli/doc 文件不存在: {cli_rel} / {doc_rel}")
+                continue
+            import subprocess
+
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(cli_path), "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except Exception as exc:
+                fails.append(f"{name}: {where} 无法运行 {cli_rel} --help: {exc}")
+                continue
+            m = re.search(r"\{([^{}]+)\}", proc.stdout)
+            if not m or not proc.stdout.strip():
+                fails.append(
+                    f"{name}: {where} {cli_rel} --help 无有效输出"
+                    f"（依赖未安装或非子命令式 CLI？）"
+                )
+                continue
+            actual = {c.strip() for c in m.group(1).split(",") if c.strip()}
+            doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
+            missing = sorted(
+                cmd for cmd in actual
+                if f"`{cmd}`" not in doc_text and f"`{cmd} " not in doc_text
+                and f"`{cmd}|`" not in doc_text
+            )
+            table_cmds: list[str] = []
+            for line in doc_text.splitlines():
+                lm = re.match(r"^\s*\|\s*`([\w-]+)`", line)
+                if lm:
+                    table_cmds.append(lm.group(1))
+            extra = sorted(set(table_cmds) - actual)
+            if missing:
+                bucket = fails if sev == "FAIL" else warns
+                bucket.append(
+                    f"{name}: {rname} 实际子命令未在 {doc_rel} 以反引号提及: {missing}"
+                )
+            if extra:
+                bucket = fails if sev == "FAIL" else warns
+                bucket.append(
+                    f"{name}: {rname} {doc_rel} 子命令表列出不存在的命令: {extra}"
+                )
         else:  # file-header
             dirs, fields = rule.get("dirs"), rule.get("fields", ["来源", "许可", "核验日期"])
             if not dirs or not fields:

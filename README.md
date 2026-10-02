@@ -13,27 +13,31 @@
 
 | 子命令 | 说明 | 关键 flag |
 | ------ | ---- | --------- |
-| `analyze-data` | 分析 LLM 提供的依赖数据 JSON（主入口） | `--conflicts` / `--security` / `--report` / `-o` |
-| `analyze` | 分析项目依赖（旧版） | `--visualize`（Mermaid）/ `--impact` |
+| `analyze-data` | 分析 LLM 提供的依赖数据 JSON（主入口） | `--conflicts` / `--security` / `--report` / `--rules` / `--baseline` / `--ignore-known` / `--from-sbom` / `--exit-code N` |
+| `analyze` | 分析项目依赖（lockfile 优先） | `--visualize`（Mermaid）/ `--impact` / `--list-parsers` |
 | `query` | 查询包上下游依赖 | `-e <ecosystem>` |
 | `search` | 按关键词搜索包 | `-e <ecosystem>` |
-| `security` | 扫描包安全漏洞（OSV） | `-e` / `--priority`（CVSS×0.5+exploit×0.3+business×0.2） |
-| `report` | 从 `deps_data.json` 生成报告 | `--format json\|html\|pdf\|sbom` |
-| `health` | 5 维度健康度评分 + Mermaid 雷达图 | `-o` |
+| `security` | 扫描包安全漏洞（OSV） | `-e` / `--priority` / `--exit-code N` / `--offline` / `--download-offline-db` / `--config` |
+| `report` | 从 `deps_data.json` 生成报告 | `--format json\|html\|pdf\|sarif\|cyclonedx\|sbom` / `--allowed-licenses` |
+| `health` | 5 维度健康度评分 + Mermaid 雷达图 | `-o` / `--allowed-licenses` / `--license-categories` / `--scorecard` |
 | `readme` | 生成依赖说明 markdown 章节 | `-o` |
 | `simulate` | 升级影响 dry-run（major=high / minor=medium / patch=low） | `--project` |
-| `monitor` | 漏洞定时扫描 + webhook 告警 | `--cron` / `--webhook` |
-| `optimize` | 依赖配置优化（去重 + 删冗余 + 识别未使用） | `--check dedupe\|redundant\|unused` / `--deep` |
+| `monitor` | 漏洞定时扫描 + webhook 告警 | `--cron` / `--webhook` / `--offline` / `--cache` |
+| `optimize` | 依赖配置优化（去重 + 删冗余 + 识别未使用） | `--check dedupe\|redundant\|unused` / `--deep` / `--apply` |
+
+**CI 退出码契约**：`0`=成功；`N`=`--exit-code N` 且发现漏洞；`128`=输入/解析失败。
 
 **7 个生态系统**：Python(PyPI) / Node.js(npm) / Java(Maven) / Rust(crates) / Ruby(RubyGems) / PHP(Packagist) / .NET(NuGet)。`security`/`query`/`search` 均支持 `-e` 指定生态。
 
-**核心机制**：Ladybug GraphDB 构建 `Package` / `DependsOn` / `ConflictsWith` / `Vulnerability` 图；漏洞扫描走 [OSV](https://osv.dev/)（CVE/GHSA + 严重度 + 修复版本）；版本推荐必须过 `check_version_constraint` 验证；目录中检测到多类生态配置并存时，显式展示生效/跳过清单后询问扫描范围，不静默缩小范围。
+**核心机制**：Ladybug GraphDB 构建 `Package` / `DependsOn` / `ConflictsWith` / `Vulnerability` 图；漏洞扫描走 [OSV](https://osv.dev/)（CVE/GHSA + 严重度 + 修复版本，purl-only 查询契约）；版本推荐必须过 `check_version_constraint` 验证；lockfile 优先于 manifest（精确版本消灭范围下界近似）；多生态并存时显式展示生效/跳过清单，不静默缩小范围。
+
+**治理能力**：漏洞豁免清单（`.dayv.toml`，带过期日与 alias 连带，报告显性列出）、许可证白名单合规（`--allowed-licenses`，UNKNOWN 单列）、声明式规则引擎（`.dayv/rules.json`，forbidden/allowed/required）、违规基线（`--baseline`/`--ignore-known` 只对新增违规失败）、OSV 离线库 + TTL 缓存、SBOM 双标准（SPDX+CycloneDX，purl 贯通可被 osv-scanner/trivy 复扫）、SARIF 2.1.0 直连 GitHub Security 页、deps.dev 传递图增强（缺失生态最小解析回退）。
 
 ## 📦 安装
 
 ```bash
-# 同步到 agent 技能目录（~/.zcode/skills 与 ~/.claude/skills）
-bash scripts/sync-skills.sh dayv
+# 同步到 agent 技能目录（在 skills 工作区根执行，脚本不在本仓内）
+bash ../scripts/sync-skills.sh dayv   # 或用仓库根的 install-skill.sh
 
 # 首跑前置：安装依赖（缺依赖时子命令会显式报错提示本步骤，不会裸 traceback 崩溃）
 pip install -r requirements.txt
@@ -66,9 +70,9 @@ python scripts/dependency_analyzer.py optimize /path/to/project --check unused
 
 ## ✅ 测试与验证
 
-- **语法**：`python3 -m py_compile scripts/*.py` 实测 20 个脚本全部通过
+- **语法**：`python3 -m py_compile scripts/*.py` 实测 29 个脚本全部通过
 - **端到端实测**：`analyze-data` 喂入样例 `deps_data.json`（numpy 1.21.0 + pandas/scipy 边）→ 生成 `report.json`，OSV 实时命中 `GHSA-fpfv-jqm9-f5jm`（numpy 1.21.0，medium）；`report --format html` 实测生成 7.2KB HTML
-- **回归测试目录未纳入 git**：clone 后不可直接 pytest（根目录仅存 `conftest.py`），验证以各子命令实际运行 + `--help` 输出核对为准
+- **回归测试**：`tests/` 已纳入 git，clone 后直接 `python -m pytest tests/ -q`（全离线 mock，不联网）；另以 `python3 scripts/skill_lint.py .` 做文档一致性门禁（SKILL.md 子命令表 vs CLI --help）
 - **已知灰区（如实标注）**：PyPI 无官方搜索 API，`search`/`query` 通过爬取 pypi.org HTML 页面解析（BeautifulSoup），页面标记变更可能导致字段解析为空——实测一次 `query fastapi` 中 `versions` 正常返回但 `latest_version` 为空；`security` 因无法解析最新版本会按设计显式拒绝执行（防假版本误报），此时改用 `analyze-data` 由 LLM 提供版本数据
 
 ## 📁 目录结构
@@ -77,16 +81,21 @@ python scripts/dependency_analyzer.py optimize /path/to/project --check unused
 dayv/
 ├── SKILL.md                  # 入口：子命令决策树 + 工作流 + 红线
 ├── requirements.txt          # real-ladybug/httpx/jinja2 等
-├── conftest.py               # pytest 配置（测试目录未入 git）
+├── conftest.py               # pytest 配置
+├── tests/                    # 离线回归测试（lint 门禁覆盖文档一致性）
 ├── references/               # subcommands / architecture / anti-patterns 文档
-└── scripts/
+├── lint-checks.json          # skill_lint 自检规则（cli-subcommands 文档门禁）
+└── scripts/                  # 29 个脚本（单文件自包含，纯 Python）
     ├── dependency_analyzer.py    # 主分析引擎（11 子命令入口）
+    ├── ecosystem_registry.py     # 生态元数据单一注册表（新增生态只改此文件）
     ├── base_ecosystem.py         # 7 生态共享 adapter（fetch→parse 统一 schema）
-    ├── report_renderer.py        # JSON/HTML/PDF 渲染
-    ├── sbom_generator.py         # SPDX 2.3 SBOM
+    ├── purl.py                   # Package URL 单点生成/解析
+    ├── report_renderer.py        # JSON/HTML/PDF/SARIF 渲染
+    ├── sbom_generator.py         # SPDX 2.3 + CycloneDX 1.5 SBOM
     ├── health_scorer.py          # 5 维度健康度 + 雷达图
     ├── dependency_optimizer.py   # 去重/删冗余/识别未使用
-    ├── monitor.py / simulator.py / impact_analyzer.py / visualizer.py / ...
+    ├── exemptions.py / license_policy.py / osv_offline.py / rule_engine.py
+    ├── violation_baseline.py / depsdev_client.py / monitor.py / simulator.py / ...
     └── pypi.py / npm.py / maven.py / crates.py / rubygems.py / packagist.py / nuget.py
 ```
 

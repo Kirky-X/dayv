@@ -97,13 +97,16 @@
 
 测试 prompt 集见 `test-prompts.json`（3 个典型场景覆盖 query/security/多语言 analyze）。
 
-单元测试（不入 git）：
-- `scripts/tests/test_report_renderer.py` — HTML/PDF/JSON 渲染契约（11 个测试）
-- `scripts/tests/test_health_scorer.py` — 5 维度评分逻辑（15 个测试）
-- `scripts/tests/test_sbom_generator.py` — SPDX 2.3 schema 完整性（22 个测试）
-- `scripts/tests/test_visualizer.py` — Mermaid 依赖树渲染 + 深度控制 + 循环检测（13 个测试）
-- `scripts/tests/test_readme_generator.py` — README 生成 + ecosystem 分组 + fetcher 注入（13 个测试）
-- `scripts/tests/test_impact_analyzer.py` — 冲突影响范围 + BFS 反向追溯 + 依赖链（10 个测试）
+回归测试（`tests/` 已入 git，clone 后可直接 `python -m pytest tests/ -q`，全离线 mock）：
+- test_g1/test_g2/test_g3 — license/SBOM/version-resolution 管线回归
+- test_r1…test_r15 — 对标调研 15 条建议逐项回归（正确性 bug/lockfile/purl/
+  退出码/豁免/许可证合规/离线库/SARIF/requirements edges/CycloneDX/deps.dev/
+  规则引擎/基线）
+- 测试共享 mock 见 `tests/_mocks.py`（FakeResponse/CapturingHttpClient/fetcher 系列）
+
+文档一致性门禁：`python3 scripts/skill_lint.py .`（lint-checks.json 声明
+cli-subcommands 规则，断言 SKILL.md 子命令表与 `dependency_analyzer.py --help`
+实测子命令集合一致）。
 - `scripts/tests/test_simulator.py` — 升级影响模拟 + 风险等级 + 冲突检测 + fetcher 注入（18 个测试）
 - `scripts/tests/test_vulnerability_prioritizer.py` — CVSS + exploit + business 加权排序（24 个测试）
 - `scripts/tests/test_monitor.py` — cron 生成 + 历史对比 + 告警格式化 + webhook（27 个测试）

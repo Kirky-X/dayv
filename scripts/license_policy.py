@@ -97,8 +97,11 @@ def classify_license(
     for cat, ids in categories.items():
         for lic_id in ids:
             for tok in tokens:
-                if tok == lic_id or tok.startswith(lic_id + "-") or tok.startswith(
-                    lic_id + " "
+                # token 无空格（re 提取），变体覆盖 -only/-or-later/+（or-later）
+                if (
+                    tok == lic_id
+                    or tok.startswith(lic_id + "-")
+                    or tok.startswith(lic_id + "+")
                 ):
                     hit_categories.add(cat)
                     break

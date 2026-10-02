@@ -386,20 +386,13 @@ def render_sarif(report: dict) -> dict:
         message = f"{v.get('package', '?')}@{v.get('version', '')} 受 {rule_id} 影响"
         if v.get("fixed_version"):
             message += f"，修复版本 {v['fixed_version']}"
+        # locations 省略：dayv 是 registry 级扫描无文件级定位，
+        # "pkg@ver" 不是合法文件 URI，写了反而在 GitHub Security 页显示异常
         results.append(
             {
                 "ruleId": rule_id,
                 "level": level,
                 "message": {"text": message},
-                "locations": [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {
-                                "uri": f"{v.get('package', '?')}@{v.get('version', '')}",
-                            }
-                        }
-                    }
-                ],
             }
         )
     return {

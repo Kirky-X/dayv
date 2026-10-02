@@ -275,7 +275,10 @@ def effective_ttl(base_ttl: Optional[int], any_inferred: bool) -> Optional[int]:
 def cache_path(
     ecosystem: str, name: str, version: str, cache_dir: Optional[str] = None
 ) -> Path:
+    # 拦截路径穿越：恶意 deps_data 包名含 "../" 时不得逃出缓存目录
+    # （"/" 保留供 npm scoped 包建子目录，但 ".." 整段替换）
     safe = re.sub(r"[^A-Za-z0-9._@/:-]", "_", f"{name}-{version}")
+    safe = safe.replace("..", "_")
     return Path(cache_dir or DEFAULT_CACHE_DIR) / ecosystem / f"{safe}.json"
 
 
