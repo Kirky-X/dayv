@@ -108,6 +108,9 @@ class DependencyNode:
     # version 是从范围约束（^1.2.0 / ~1.2.3 / >=2.0 等）推断的下界而非精确锁定。
     # 无法得到确定版本的包 version 为空串（禁止编造 "0.0.0" 送 OSV 查询）。
     version_inferred: bool = False
+    # version 来自 lockfile 精确锁定（package-lock.json/poetry.lock/Cargo.lock 等），
+    # OSV 受影响判定不再保守近似（与 version_inferred 互斥）
+    version_resolved: bool = False
     properties: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1681,15 +1684,6 @@ def parse_requirements_txt(
     return packages, edges
 
 
-# parser 逻辑名 → 实现函数（文件清单与生态归属的单一来源在 ecosystem_registry，
-# 新增可解析文件 = 注册表加一条目 + 此处加一个函数引用）
-PARSER_FUNCS = {
-    "pyproject": parse_pyproject_toml,
-    "requirements": parse_requirements_txt,
-    "package_json": parse_package_json,
-}
-
-
 def parse_dependencies(
     project_path: str,
 ) -> tuple[List[DependencyNode], List[DependencyEdge], str]:
@@ -1825,6 +1819,7 @@ def _deps_data_to_graph(data: Dict[str, Any]) -> Tuple[List[DependencyNode], Lis
     for pkg_data in data["packages"]:
         raw_version = str(pkg_data.get("version", "") or "")
         resolved = _extract_concrete_version(raw_version)
+        version_resolved = bool(pkg_data.get("version_resolved", False))
         packages.append(
             DependencyNode(
                 name=pkg_data["name"],
@@ -1832,7 +1827,11 @@ def _deps_data_to_graph(data: Dict[str, Any]) -> Tuple[List[DependencyNode], Lis
                 version=resolved[0] if resolved else "",
                 ecosystem=pkg_data.get("ecosystem", "pypi"),
                 is_root=pkg_data.get("is_root", False),
-                version_inferred=resolved[1] if resolved else False,
+                # deps_data 显式声明 version_resolved 的包视为精确锁定
+                # （如 --from-sbom 回灌的 SBOM、外部 lockfile 工具产出）
+                version_inferred=(resolved[1] if resolved else False)
+                and not version_resolved,
+                version_resolved=version_resolved,
             )
         )
 
@@ -1846,6 +1845,455 @@ def _deps_data_to_graph(data: Dict[str, Any]) -> Tuple[List[DependencyNode], Lis
             )
         )
     return packages, edges
+
+
+# ============ lockfile 解析器（R4：精确版本来源，优先于 manifest） ============
+# 每个 parser 返回 (packages, edges)：packages 含根节点（is_root=True，来自同目录
+# manifest 或 lockfile 自身的根条目），所有非根节点 version_resolved=True 且
+# version_inferred=False（精确锁定，OSV 判定不再保守近似）。
+
+
+def _lockfile_root_from_toml(lock_path: Path, manifest_name: str) -> Dict[str, Any]:
+    """读同目录 TOML manifest 的 project/package 段 name+version（拿不到返回 {}）。"""
+    manifest = lock_path.parent / manifest_name
+    if not manifest.is_file():
+        return {}
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+    try:
+        with manifest.open("rb") as f:
+            data = tomllib.load(f)
+    except Exception as e:
+        logger.warning(f"解析 {manifest.name} 失败（根节点信息降级）: {e}")
+        return {}
+    info = data.get("project") or data.get("package") or {}
+    if not info.get("name"):
+        return {}
+    return {"name": info["name"], "version": str(info.get("version", "0.0.0"))}
+
+
+def _manifest_constraints(lock_path: Path, manifest_name: str) -> Dict[str, str]:
+    """读同目录 manifest 的依赖约束映射（pyproject.toml 的 [project].dependencies）。"""
+    manifest = lock_path.parent / manifest_name
+    if not manifest.is_file():
+        return {}
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+    try:
+        with manifest.open("rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return {}
+    constraints: Dict[str, str] = {}
+    for dep in (data.get("project") or {}).get("dependencies", []) or []:
+        m = re.match(r"([A-Za-z0-9_.-]+)(?:\[.*?\])?\s*(.*)", str(dep))
+        if m:
+            constraints[m.group(1).lower()] = (m.group(2) or "*").strip() or "*"
+    return constraints
+
+
+def _name_version(label: str) -> tuple[str, str]:
+    """Cargo.lock dependencies 条目 "name" 或 "name 1.2.3" → (name, version|空)。"""
+    parts = label.strip().split()
+    return (parts[0], parts[1]) if len(parts) > 1 else (parts[0], "")
+
+
+def parse_package_lock_json(project_path: str):
+    """package-lock.json v2/v3：packages["node_modules/*"] 为精确锁定版本。"""
+    path_obj = Path(project_path)
+    try:
+        with path_obj.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"解析 JSON 文件失败: {e}")
+        sys.exit(1)
+
+    all_entries = data.get("packages")
+    if not isinstance(all_entries, dict):
+        logger.error("package-lock.json 缺少 packages 字段（v1 格式请升级 lockfile 或改用 package.json）")
+        sys.exit(1)
+
+    root_entry = all_entries.get("", {}) or {}
+    root_name = root_entry.get("name") or data.get("name") or "unknown"
+    root_version = str(root_entry.get("version") or data.get("version") or "0.0.0")
+    packages = [
+        DependencyNode(
+            name=root_name, version=root_version, ecosystem="npm", is_root=True
+        )
+    ]
+    edges: List[DependencyEdge] = []
+
+    name_to_node: Dict[str, DependencyNode] = {}
+    for key, entry in all_entries.items():
+        if key == "" or not isinstance(entry, dict):
+            continue
+        # 取最后一段 node_modules/ 之后的包名（嵌套 node_modules/a/node_modules/b → b）
+        name = key.rsplit("node_modules/", 1)[-1]
+        if not name or not entry.get("version"):
+            continue
+        node = DependencyNode(
+            name=name,
+            version=str(entry["version"]),
+            ecosystem="npm",
+            version_resolved=True,
+        )
+        if name in name_to_node:
+            continue  # 同名嵌套：首见为准（PK 语义），不重复建节点
+        name_to_node[name] = node
+        packages.append(node)
+
+    # 根约束边（dependencies + devDependencies 分组信息供规则引擎使用）
+    for group in ("dependencies", "devDependencies"):
+        for dep_name, constraint in (root_entry.get(group) or {}).items():
+            edges.append(
+                DependencyEdge(
+                    source=root_name,
+                    target=dep_name,
+                    constraint=str(constraint),
+                    properties={"group": group},
+                )
+            )
+
+    # lockfile 内部依赖边（目标未锁定时跳过并计数，不打断整批）
+    inner_skipped = 0
+    for key, entry in all_entries.items():
+        if key == "" or not isinstance(entry, dict):
+            continue
+        src_name = key.rsplit("node_modules/", 1)[-1]
+        for dep_name, constraint in (entry.get("dependencies") or {}).items():
+            if dep_name in name_to_node:
+                edges.append(
+                    DependencyEdge(
+                        source=src_name,
+                        target=dep_name,
+                        constraint=str(constraint),
+                    )
+                )
+            else:
+                inner_skipped += 1
+    if inner_skipped:
+        logger.info(f"package-lock 内部边跳过 {inner_skipped} 条（目标未出现在锁定清单）")
+
+    return packages, edges
+
+
+def parse_poetry_lock(project_path: str):
+    """poetry.lock：[[package]] 精确版本；图约束边来自同目录 pyproject.toml。"""
+    path_obj = Path(project_path)
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+    try:
+        with path_obj.open("rb") as f:
+            data = tomllib.load(f)
+    except Exception as e:
+        logger.error(f"解析 TOML 文件失败: {e}")
+        sys.exit(1)
+
+    root_info = _lockfile_root_from_toml(path_obj, "pyproject.toml")
+    root_name = root_info.get("name", "unknown")
+    packages = [
+        DependencyNode(
+            name=root_name,
+            version=root_info.get("version", "0.0.0"),
+            ecosystem="pypi",
+            is_root=True,
+        )
+    ]
+
+    constraints = _manifest_constraints(path_obj, "pyproject.toml")
+    edges: List[DependencyEdge] = []
+    seen: set = set()
+    for pkg in data.get("package", []) or []:
+        if not isinstance(pkg, dict) or not pkg.get("name") or not pkg.get("version"):
+            continue
+        name = str(pkg["name"]).lower()
+        if name in seen:
+            continue
+        seen.add(name)
+        packages.append(
+            DependencyNode(
+                name=name,
+                version=str(pkg["version"]),
+                ecosystem="pypi",
+                version_resolved=True,
+            )
+        )
+        if name in constraints:
+            edges.append(
+                DependencyEdge(
+                    source=root_name, target=name, constraint=constraints[name]
+                )
+            )
+    return packages, edges
+
+
+def parse_cargo_lock(project_path: str):
+    """Cargo.lock：[[package]] name/version + dependencies 数组（含 "name ver" 消歧）。"""
+    path_obj = Path(project_path)
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+    try:
+        with path_obj.open("rb") as f:
+            data = tomllib.load(f)
+    except Exception as e:
+        logger.error(f"解析 TOML 文件失败: {e}")
+        sys.exit(1)
+
+    root_info = _lockfile_root_from_toml(path_obj, "Cargo.toml")
+    root_name = root_info.get("name", "unknown")
+    packages = [
+        DependencyNode(
+            name=root_name,
+            version=root_info.get("version", "0.0.0"),
+            ecosystem="crates",
+            is_root=True,
+        )
+    ]
+    edges: List[DependencyEdge] = []
+
+    # 根约束边来自 Cargo.toml [dependencies]（缺 manifest 时退化为无根边）
+    root_constraints: Dict[str, str] = {}
+    manifest = path_obj.parent / "Cargo.toml"
+    if manifest.is_file():
+        try:
+            import tomllib as _tomllib
+        except ImportError:
+            import tomli as _tomllib  # type: ignore
+        try:
+            with manifest.open("rb") as f:
+                cargo_toml = _tomllib.load(f)
+            for dep_name, spec in (cargo_toml.get("dependencies") or {}).items():
+                if isinstance(spec, dict):
+                    ver = spec.get("version")
+                    root_constraints[dep_name] = str(ver) if ver else "*"
+                else:
+                    root_constraints[dep_name] = str(spec) if spec else "*"
+        except Exception as e:
+            logger.warning(f"解析 Cargo.toml 依赖约束失败（跳过根约束边）: {e}")
+
+    name_to_node: Dict[str, DependencyNode] = {}
+    for pkg in data.get("package", []) or []:
+        if not isinstance(pkg, dict) or not pkg.get("name") or not pkg.get("version"):
+            continue
+        name = str(pkg["name"])
+        if name in name_to_node:
+            continue
+        node = DependencyNode(
+            name=name,
+            version=str(pkg["version"]),
+            ecosystem="crates",
+            version_resolved=True,
+        )
+        name_to_node[name] = node
+        packages.append(node)
+        if name in root_constraints:
+            edges.append(
+                DependencyEdge(
+                    source=root_name,
+                    target=name,
+                    constraint=root_constraints[name],
+                )
+            )
+
+    # 内部依赖边："cfg-if 1.0.0"（同名多版本消歧）或 "getrandom"
+    for pkg in data.get("package", []) or []:
+        if not isinstance(pkg, dict):
+            continue
+        src_name = str(pkg.get("name", ""))
+        for dep_label in pkg.get("dependencies", []) or []:
+            dep_name, dep_ver = _name_version(str(dep_label))
+            target = name_to_node.get(dep_name)
+            if target is None:
+                continue
+            if dep_ver and target.version != dep_ver:
+                continue  # 多版本场景：指向的不是当前节点，跳过（显性近似）
+            edges.append(
+                DependencyEdge(source=src_name, target=dep_name, constraint="*")
+            )
+    return packages, edges
+
+
+def parse_composer_lock(project_path: str):
+    """composer.lock：packages + packages-dev 精确版本；根约束来自 composer.json。"""
+    path_obj = Path(project_path)
+    try:
+        with path_obj.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"解析 JSON 文件失败: {e}")
+        sys.exit(1)
+
+    root_name = "unknown"
+    root_constraints: Dict[str, str] = {}
+    manifest = path_obj.parent / "composer.json"
+    if manifest.is_file():
+        try:
+            with manifest.open("r", encoding="utf-8") as f:
+                composer = json.load(f)
+            # 保留完整 vendor/name 作为根名（与包节点命名空间一致，避免同名歧义）
+            root_name = composer.get("name") or "unknown"
+            root_constraints = dict(composer.get("require") or {})
+        except Exception as e:
+            logger.warning(f"解析 composer.json 失败（根节点信息降级）: {e}")
+
+    packages = [
+        DependencyNode(
+            name=root_name,
+            version="0.0.0",
+            ecosystem="packagist",
+            is_root=True,
+        )
+    ]
+    edges: List[DependencyEdge] = []
+
+    def _is_platform_dep(name: str) -> bool:
+        return name == "php" or name.startswith("ext-") or name.startswith("lib-")
+
+    for group, group_key in (("dependencies", "packages"), ("dev", "packages-dev")):
+        for pkg in data.get(group_key, []) or []:
+            if not isinstance(pkg, dict) or not pkg.get("name"):
+                continue
+            full_name = str(pkg["name"])
+            node = DependencyNode(
+                name=full_name,
+                version=str(pkg.get("version", "")),
+                ecosystem="packagist",
+                version_resolved=True,
+                properties={"group": group},
+            )
+            packages.append(node)
+            if full_name in root_constraints and group == "dependencies":
+                edges.append(
+                    DependencyEdge(
+                        source=root_name,
+                        target=full_name,
+                        constraint=str(root_constraints[full_name]),
+                    )
+                )
+
+    name_set = {p.name for p in packages}
+    for group_key in ("packages", "packages-dev"):
+        for pkg in data.get(group_key, []) or []:
+            if not isinstance(pkg, dict) or not pkg.get("name"):
+                continue
+            for dep_name, constraint in (pkg.get("require") or {}).items():
+                if _is_platform_dep(str(dep_name)) or str(dep_name) not in name_set:
+                    continue
+                edges.append(
+                    DependencyEdge(
+                        source=str(pkg["name"]),
+                        target=str(dep_name),
+                        constraint=str(constraint),
+                    )
+                )
+    return packages, edges
+
+
+def parse_gemfile_lock(project_path: str):
+    """Gemfile.lock：GEM specs 精确版本 + DEPENDENCIES 根约束（文本格式逐行解析）。"""
+    path_obj = Path(project_path)
+    try:
+        lines = path_obj.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as e:
+        logger.error(f"读取文件失败: {e}")
+        sys.exit(1)
+
+    root_name = path_obj.parent.name or "unknown"
+    packages = [
+        DependencyNode(
+            name=root_name, version="0.0.0", ecosystem="rubygems", is_root=True
+        )
+    ]
+    edges: List[DependencyEdge] = []
+    name_to_node: Dict[str, DependencyNode] = {}
+
+    section = ""
+    in_specs = False
+    current_spec: Optional[str] = None
+    # specs 按字母序排列，依赖约束行可能先于目标 spec 行出现——先收集后建边
+    pending_inner: List[tuple] = []  # (source, target, constraint)
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith(" "):
+            section = line.strip()
+            in_specs = False
+            current_spec = None
+            continue
+        stripped = line.strip()
+        if section == "GEM":
+            if stripped == "specs:":
+                in_specs = True
+                current_spec = None
+                continue
+            if not in_specs:
+                continue  # remote: 等 GEM 段元数据行
+            m = re.match(r"^([^\s(]+)(?: \(([^)]+)\))?$", stripped)
+            if not m:
+                continue
+            name, version = m.group(1), m.group(2)
+            indent = len(line) - len(line.lstrip(" "))
+            if indent <= 4:
+                # 4 空格缩进 = 锁定包行
+                if version and name not in name_to_node:
+                    node = DependencyNode(
+                        name=name,
+                        version=version,
+                        ecosystem="rubygems",
+                        version_resolved=True,
+                    )
+                    name_to_node[name] = node
+                    packages.append(node)
+                current_spec = name if name in name_to_node else None
+            elif current_spec is not None:
+                # 6+ 空格缩进 = 上一锁定包的传递依赖约束行
+                pending_inner.append((current_spec, name, version or "*"))
+        elif section == "DEPENDENCIES":
+            m = re.match(r"^([^\s(]+)(?: \(([^)]+)\))?$", stripped)
+            if m and m.group(1) in name_to_node:
+                edges.append(
+                    DependencyEdge(
+                        source=root_name,
+                        target=m.group(1),
+                        constraint=m.group(2) or "*",
+                    )
+                )
+
+    skipped_inner = 0
+    for src, target, constraint in pending_inner:
+        if target in name_to_node:
+            edges.append(
+                DependencyEdge(source=src, target=target, constraint=constraint)
+            )
+        else:
+            skipped_inner += 1
+    if skipped_inner:
+        logger.info(
+            f"Gemfile.lock 内部边跳过 {skipped_inner} 条（目标未出现在锁定 specs 清单）"
+        )
+    return packages, edges
+
+
+# parser 逻辑名 → 实现函数（文件清单与生态归属的单一来源在 ecosystem_registry，
+# 新增可解析文件 = 注册表加一条目 + 此处加一个函数引用）
+PARSER_FUNCS = {
+    "pyproject": parse_pyproject_toml,
+    "requirements": parse_requirements_txt,
+    "package_json": parse_package_json,
+    "package_lock": parse_package_lock_json,
+    "poetry_lock": parse_poetry_lock,
+    "cargo_lock": parse_cargo_lock,
+    "composer_lock": parse_composer_lock,
+    "gemfile_lock": parse_gemfile_lock,
+}
 
 
 def cmd_analyze_data(args):
@@ -2043,6 +2491,7 @@ def _to_deps_data(packages: List[DependencyNode], edges: List[DependencyEdge]) -
                 "ecosystem": p.ecosystem,
                 "is_root": p.is_root,
                 "license": p.properties.get("license", ""),
+                "version_resolved": p.version_resolved,
             }
             for p in packages
         ],
