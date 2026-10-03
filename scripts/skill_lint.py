@@ -51,8 +51,8 @@ SKIP_DIR_NAMES = {
 MD_LINK_RE = re.compile(r"\]\(([\w][\w./-]*\.md)(?:#[^)]*)?\)")
 INTERNAL_PATH_RE = re.compile(r"`?(?<![-\w/])((?:references|scripts|tests)/[\w./-]*\.md)\b`?")
 ANY_PATH_RE = re.compile(r"`?(?<![\w./-])([\w][\w./-]*/[\w./-]*\.md)\b`?")
-CODE_FENCE_RE = re.compile(r"```.*?```", re.S)
-FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
+CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 
 
 def strip_code(text: str) -> str:
@@ -206,6 +206,7 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                     capture_output=True,
                     text=True,
                     timeout=60,
+                    check=False,
                 )
             except Exception as exc:
                 fails.append(f"{name}: {where} 无法运行 {cli_rel} --help: {exc}")
@@ -356,7 +357,7 @@ def lint_repo(repo: Path) -> tuple[list[str], list[str]]:
                 fails.append(f"{name}: frontmatter metadata 必须是 string→string 映射")
 
     gi = repo / ".gitignore"
-    if not gi.is_file() or not re.search(r"^specmark/?$", gi.read_text(encoding="utf-8", errors="replace"), re.M):
+    if not gi.is_file() or not re.search(r"^specmark/?$", gi.read_text(encoding="utf-8", errors="replace"), re.MULTILINE):
         fails.append(f"{name}: .gitignore 缺 specmark/ 规则（全局规则 24）")
 
     json_assets = repo_files(repo, ".", (".json",))
@@ -398,11 +399,14 @@ def lint_repo(repo: Path) -> tuple[list[str], list[str]]:
 
     vendored = repo / "scripts" / "skill_lint.py"
     canonical = Path(__file__).resolve()
-    if vendored.is_file() and vendored.resolve() != canonical:
-        if vendored.read_bytes() != canonical.read_bytes():
-            fails.append(
-                f"{name}: scripts/skill_lint.py vendored 副本与工作区正本不一致（重跑 scripts/vendor-skill-lint.sh 分发）"
-            )
+    if (
+        vendored.is_file()
+        and vendored.resolve() != canonical
+        and vendored.read_bytes() != canonical.read_bytes()
+    ):
+        fails.append(
+            f"{name}: scripts/skill_lint.py vendored 副本与工作区正本不一致（重跑 scripts/vendor-skill-lint.sh 分发）"
+        )
 
     if not (repo / "LICENSE").is_file():
         warns.append(f"{name}: 缺 LICENSE 文件")
