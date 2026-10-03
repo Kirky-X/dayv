@@ -4,7 +4,7 @@ description: "依赖分析引擎（PyPI/npm/Maven 等 7 生态系统）。分析
 argument-hint: "<analyze-data|analyze|query|search|security|report|health|readme|simulate|monitor|optimize> [options]"
 license: MIT
 metadata:
-  version: "0.1.1"
+  version: "0.1.3"
   author: "Kirky-X"
   repo: "https://github.com/Kirky-X/dayv"
   tags: "dependency, 依赖树, 版本冲突, 安全漏洞, package.json, Cargo.toml"
