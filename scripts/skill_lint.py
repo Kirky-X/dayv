@@ -286,7 +286,14 @@ def parse_frontmatter(text: str):
                 key = m2.group(1)
                 data[key] = m2.group(2).strip().strip("\"'")
             elif key and re.match(r"^\s+\S", line):
-                data[key] = f"{data[key]} {line.strip()}" if data.get(key) else line.strip()
+                m3 = re.match(r"^\s+([A-Za-z0-9_-]+):\s*(.*)$", line)
+                if m3:
+                    # 一层嵌套子键（如 metadata.version）必须成 dict，否则 string→string 校验在无 PyYAML 环境误报 FAIL
+                    if not isinstance(data.get(key), dict):
+                        data[key] = {}
+                    data[key][m3.group(1)] = m3.group(2).strip().strip("\"'")
+                else:
+                    data[key] = f"{data[key]} {line.strip()}" if data.get(key) else line.strip()
         return data, None
     except Exception as exc:  # yaml 解析错误
         return None, f"frontmatter YAML 非法: {exc}"
