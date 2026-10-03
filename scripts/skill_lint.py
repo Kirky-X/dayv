@@ -44,12 +44,28 @@ from pathlib import Path
 MAX_DESC = 1024
 MAX_SKILLMD_LINES = 500
 SKIP_DIR_NAMES = {
-    ".git", ".github", ".claude", ".claude-plugin", ".analysis", ".pytest_cache",
-    ".ruff_cache", ".venv", "__pycache__", "node_modules", "specmark", "openspec",
-    "corpus", "temp", ".attic", "logs", "open-code-review",
+    ".git",
+    ".github",
+    ".claude",
+    ".claude-plugin",
+    ".analysis",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "specmark",
+    "openspec",
+    "corpus",
+    "temp",
+    ".attic",
+    "logs",
+    "open-code-review",
 }
 MD_LINK_RE = re.compile(r"\]\(([\w][\w./-]*\.md)(?:#[^)]*)?\)")
-INTERNAL_PATH_RE = re.compile(r"`?(?<![-\w/])((?:references|scripts|tests)/[\w./-]*\.md)\b`?")
+INTERNAL_PATH_RE = re.compile(
+    r"`?(?<![-\w/])((?:references|scripts|tests)/[\w./-]*\.md)\b`?"
+)
 ANY_PATH_RE = re.compile(r"`?(?<![\w./-])([\w][\w./-]*/[\w./-]*\.md)\b`?")
 CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
@@ -84,15 +100,19 @@ def check_links(repo: Path) -> tuple[list[str], list[str]]:
         except ValueError:
             return True
 
-    sources = [repo / "SKILL.md"] + repo_files(repo, "references", (".md",)) + [
-        repo / "README.md", repo / "README_EN.md"
-    ]
+    sources = (
+        [repo / "SKILL.md"]
+        + repo_files(repo, "references", (".md",))
+        + [repo / "README.md", repo / "README_EN.md"]
+    )
     for src in sources:
         if not src.is_file():
             continue
         text = strip_code(src.read_text(encoding="utf-8", errors="replace"))
         src_dir = src.parent
-        internal = {m for m in INTERNAL_PATH_RE.findall(text)} | {m for m in MD_LINK_RE.findall(text)}
+        internal = {m for m in INTERNAL_PATH_RE.findall(text)} | {
+            m for m in MD_LINK_RE.findall(text)
+        }
         other = set(ANY_PATH_RE.findall(text)) - internal
         for raw in sorted(internal):
             key = (str(src.relative_to(repo)), raw)
@@ -116,7 +136,9 @@ def check_orphans(repo: Path) -> list[str]:
     tokens: set[str] = set()
     for p in [repo / "SKILL.md"] + refs:
         if p.is_file():
-            for tok in re.findall(r"[\w./-]+", strip_code(p.read_text(encoding="utf-8", errors="replace"))):
+            for tok in re.findall(
+                r"[\w./-]+", strip_code(p.read_text(encoding="utf-8", errors="replace"))
+            ):
                 # 路径 token 的各级后缀均视为引用形态：references/x.md、../references/x.md、x.md 同指一文件
                 segs = tok.split("/")
                 for i in range(len(segs)):
@@ -148,14 +170,29 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     except Exception as exc:
         return [f"{name}: lint-checks.json 非法 JSON: {exc}"], warns
-    if not isinstance(cfg, dict) or set(cfg) != {"checks"} or not isinstance(cfg["checks"], list):
+    if (
+        not isinstance(cfg, dict)
+        or set(cfg) != {"checks"}
+        or not isinstance(cfg["checks"], list)
+    ):
         return [f'{name}: lint-checks.json 顶层必须是 {{"checks": [...]}} 映射'], warns
     for i, rule in enumerate(cfg["checks"], 1):
         where = f"lint-checks.json checks[{i}]"
         if not isinstance(rule, dict):
             fails.append(f"{name}: {where} 不是对象")
             continue
-        unknown = set(rule) - {"name", "type", "file", "pattern", "min_count", "dirs", "fields", "severity", "cli", "doc"}
+        unknown = set(rule) - {
+            "name",
+            "type",
+            "file",
+            "pattern",
+            "min_count",
+            "dirs",
+            "fields",
+            "severity",
+            "cli",
+            "doc",
+        }
         if unknown:
             fails.append(f"{name}: {where} 未知键: {sorted(unknown)}")
             continue
@@ -182,13 +219,19 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                 fails.append(f"{name}: {where} min_count 必须为 ≥1 整数")
                 continue
             try:
-                found = len(re.findall(pattern, target.read_text(encoding="utf-8", errors="replace")))
+                found = len(
+                    re.findall(
+                        pattern, target.read_text(encoding="utf-8", errors="replace")
+                    )
+                )
             except re.error as exc:
                 fails.append(f"{name}: {where} 非法正则: {exc}")
                 continue
             if found < min_count:
                 bucket = fails if sev == "FAIL" else warns
-                bucket.append(f"{name}: {rname} 未满足（{rel} 命中 {found}/{min_count}）")
+                bucket.append(
+                    f"{name}: {rname} 未满足（{rel} 命中 {found}/{min_count}）"
+                )
         elif rtype == "cli-subcommands":
             cli_rel, doc_rel = rule.get("cli"), rule.get("doc")
             if not cli_rel or not doc_rel:
@@ -196,7 +239,9 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                 continue
             cli_path, doc_path = repo / cli_rel, repo / doc_rel
             if not cli_path.is_file() or not doc_path.is_file():
-                fails.append(f"{name}: {where} cli/doc 文件不存在: {cli_rel} / {doc_rel}")
+                fails.append(
+                    f"{name}: {where} cli/doc 文件不存在: {cli_rel} / {doc_rel}"
+                )
                 continue
             import subprocess
 
@@ -221,8 +266,10 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
             actual = {c.strip() for c in m.group(1).split(",") if c.strip()}
             doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
             missing = sorted(
-                cmd for cmd in actual
-                if f"`{cmd}`" not in doc_text and f"`{cmd} " not in doc_text
+                cmd
+                for cmd in actual
+                if f"`{cmd}`" not in doc_text
+                and f"`{cmd} " not in doc_text
                 and f"`{cmd}|`" not in doc_text
             )
             table_cmds: list[str] = []
@@ -242,7 +289,10 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                     f"{name}: {rname} {doc_rel} 子命令表列出不存在的命令: {extra}"
                 )
         else:  # file-header
-            dirs, fields = rule.get("dirs"), rule.get("fields", ["来源", "许可", "核验日期"])
+            dirs, fields = (
+                rule.get("dirs"),
+                rule.get("fields", ["来源", "许可", "核验日期"]),
+            )
             if not dirs or not fields:
                 fails.append(f"{name}: {where} file-header 需要 dirs 与 fields")
                 continue
@@ -259,7 +309,9 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                 missing = [f for f in fields if f not in text]
                 if missing:
                     bucket = fails if sev == "FAIL" else warns
-                    bucket.append(f"{name}: {rname} 缺少 {'、'.join(missing)}: {p.relative_to(repo)}")
+                    bucket.append(
+                        f"{name}: {rname} 缺少 {'、'.join(missing)}: {p.relative_to(repo)}"
+                    )
     return fails, warns
 
 
@@ -294,7 +346,9 @@ def parse_frontmatter(text: str):
                         data[key] = {}
                     data[key][m3.group(1)] = m3.group(2).strip().strip("\"'")
                 else:
-                    data[key] = f"{data[key]} {line.strip()}" if data.get(key) else line.strip()
+                    data[key] = (
+                        f"{data[key]} {line.strip()}" if data.get(key) else line.strip()
+                    )
         return data, None
     except Exception as exc:  # yaml 解析错误
         return None, f"frontmatter YAML 非法: {exc}"
@@ -330,7 +384,9 @@ def lint_repo(repo: Path) -> tuple[list[str], list[str]]:
         fm = {}
     else:
         if fm.get("name") != name:
-            fails.append(f"{name}: frontmatter name={fm.get('name')!r} 与目录名不一致（agentskills 规范要求同名）")
+            fails.append(
+                f"{name}: frontmatter name={fm.get('name')!r} 与目录名不一致（agentskills 规范要求同名）"
+            )
         desc = str(fm.get("description", ""))
         if not desc:
             fails.append(f"{name}: frontmatter 缺 description")
@@ -347,7 +403,9 @@ def lint_repo(repo: Path) -> tuple[list[str], list[str]]:
         if isinstance(sj, dict) and fm:
             meta = fm.get("metadata")
             if meta is None:
-                warns.append(f"{name}: frontmatter 缺 metadata（agentskills 规范；version/author/repo 应与 skill.json 对齐）")
+                warns.append(
+                    f"{name}: frontmatter 缺 metadata（agentskills 规范；version/author/repo 应与 skill.json 对齐）"
+                )
             elif isinstance(meta, dict):
                 if meta.get("version") != sj.get("version"):
                     fails.append(
@@ -357,7 +415,9 @@ def lint_repo(repo: Path) -> tuple[list[str], list[str]]:
                 fails.append(f"{name}: frontmatter metadata 必须是 string→string 映射")
 
     gi = repo / ".gitignore"
-    if not gi.is_file() or not re.search(r"^specmark/?$", gi.read_text(encoding="utf-8", errors="replace"), re.MULTILINE):
+    if not gi.is_file() or not re.search(
+        r"^specmark/?$", gi.read_text(encoding="utf-8", errors="replace"), re.MULTILINE
+    ):
         fails.append(f"{name}: .gitignore 缺 specmark/ 规则（全局规则 24）")
 
     json_assets = repo_files(repo, ".", (".json",))
@@ -369,22 +429,31 @@ def lint_repo(repo: Path) -> tuple[list[str], list[str]]:
 
     lines = text.count("\n") + 1
     if lines > MAX_SKILLMD_LINES:
-        warns.append(f"{name}: SKILL.md {lines} 行，超过 {MAX_SKILLMD_LINES} 行建议上限")
+        warns.append(
+            f"{name}: SKILL.md {lines} 行，超过 {MAX_SKILLMD_LINES} 行建议上限"
+        )
 
     link_fails, link_warns = check_links(repo)
     for miss in link_fails:
         fails.append(f"{name}: 引用不存在的仓库内文档 {miss}")
     if link_warns:
         sample = "；".join(link_warns[:3])
-        warns.append(f"{name}: {len(link_warns)} 处外部/示例路径未在本仓命中（多为上游项目或示例产物，确认非笔误即可）{sample}")
+        warns.append(
+            f"{name}: {len(link_warns)} 处外部/示例路径未在本仓命中（多为上游项目或示例产物，确认非笔误即可）{sample}"
+        )
 
     scripts = [
-        p for p in repo_files(repo, "scripts", (".py", ".sh"))
+        p
+        for p in repo_files(repo, "scripts", (".py", ".sh"))
         if p.name != "skill_lint.py"
     ]
-    tests = [p for p in repo_files(repo, "tests", (".py",)) if p.name.startswith("test")]
+    tests = [
+        p for p in repo_files(repo, "tests", (".py",)) if p.name.startswith("test")
+    ]
     if scripts and not tests:
-        warns.append(f"{name}: scripts/ 有 {len(scripts)} 个脚本但无 tests/ 覆盖（K-Dense 覆盖守卫口径）")
+        warns.append(
+            f"{name}: scripts/ 有 {len(scripts)} 个脚本但无 tests/ 覆盖（K-Dense 覆盖守卫口径）"
+        )
 
     orphans = check_orphans(repo)
     if orphans:
