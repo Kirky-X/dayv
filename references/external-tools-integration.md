@@ -3,10 +3,11 @@
 > 上游外部工具（漏洞扫描 / SBOM 生成 / SBOM 运维）的能力对标、集成设计、SBOM diff 语义、工具注册表模式与引入决策清单。
 > **当前状态：dayv 未集成任何外部二进制，本文件是可评审方案，不是实施记录。**
 > 核实时间：2026-09-30。事实来源：GitHub API（仓库元数据 / releases）+ 各项目 README 与官方文档。
+> 现状复核：2026-10-04 按当前代码逐项更新 §1.2 / §1.3 现状列——lockfile 解析、离线漏洞库、许可证白名单、生态元数据登记处、SBOM 双标准 + purl 此前列为缺口的项已自研补齐；未更新的方案章节（§2–§5）仍为设计建议。
 
 ## 0. 一句话结论
 
-dayv 的 **7 生态 registry 查询 + 图分析 + 冲突检测 + unused 检测是自研且有差异化价值**；但 **SBOM 生成、SBOM diff/merge/validate、lockfile 解析、离线漏洞库** 四块是真实缺口，其中三块被成熟工具以宽松许可覆盖。三条建议路线（自研补齐 / 外部工具可选增强 / 混合）需要维护者拍板，见 [§5](#5-依赖引入决策清单待拍板)。
+dayv 的 **7 生态 registry 查询 + 图分析 + 冲突检测 + unused 检测是自研且有差异化价值**。本文件核实（2026-09-30）时 **SBOM 生成、SBOM diff/merge/validate、lockfile 解析、离线漏洞库** 四块是真实缺口；此后 lockfile 解析、离线漏洞库、SBOM 双标准 + purl、许可证白名单、生态元数据登记处均已自研补齐（见 [§1.2](#12-逐项对标已覆盖--真实缺口--重复造轮子) / [§1.3](#13-dayv-现状真实缺口清单) 现状列），**SBOM diff/merge/validate/sign 与外部工具登记处**仍是缺口。三条建议路线（自研补齐 / 外部工具可选增强 / 混合）需要维护者拍板，见 [§5](#5-依赖引入决策清单待拍板)。
 
 ---
 
@@ -150,35 +151,35 @@ dayv 的 **7 生态 registry 查询 + 图分析 + 冲突检测 + unused 检测�
 | unused 依赖检测（声明但代码未引用） | `dependency_optimizer.find_unused` + `ECOSYSTEM_SCAN` 正则扫描 | ✅ **自研独有**（osv-scanner / syft 都不做，需调用图） |
 | 漏洞优先级业务排序 | `vulnerability_prioritizer`（CVSS×0.5 + exploit×0.3 + business×0.2） | ✅ **自研覆盖，保留** |
 | 漏洞历史对比 + webhook 告警 | `monitor.py` | ✅ **自研覆盖，保留** |
-| **manifest 解析** | **只实现 3 个**：`pyproject.toml` / `package.json` / `requirements.txt` | 🔴 **真实缺口**。osv-scanner 覆盖 19+ lockfile 类型、12 生态；`detect_dependency_file` 能认出 `pom.xml`/`Cargo.toml`/`Gemfile`/`composer.json`/`.csproj` 但 `parse_dependencies` 直接 `sys.exit(1)` |
-| **lockfile 解析（精确版本）** | **完全没有** | 🔴 **真实缺口**。`parse_package_json` 用 `lstrip("^~>=<")` 把区间当版本；`parse_pyproject_toml` 只取首个 `>=` 界、缺省填 `"0.0.0"`。这些"伪版本"随后被送进 OSV querybatch → 系统性误报/漏报（与 SKILL.md 自己写的红线"用假版本跑 security"矛盾） |
-| **离线漏洞扫描** | 无 | 🔴 **真实缺口**。osv-scanner 有 `--offline` + 离线数据库下载 |
-| **许可证扫描（对白名单）** | 无 | 🔴 **真实缺口**。osv-scanner `--licenses="MIT,Apache-2.0"` |
+| **manifest 解析** | 完整 parser 8 个（`PARSER_FUNCS`，`dependency_analyzer.py:3246`：pyproject/requirements/package_json + 5 个 lockfile）；另有 7 个 manifest 最小解析器（`_MINIMAL_PARSERS`，`dependency_analyzer.py:2325`：Cargo.toml/pom.xml/Gemfile/composer.json/.csproj/.fsproj/.vbproj）+ deps.dev 传递图增强 | 🟡 **已大幅补齐**。build.gradle 等仍无解析路径；osv-scanner 覆盖 19+ lockfile 类型、12 生态仍领先 |
+| **lockfile 解析（精确版本）** | package-lock.json (v2/v3) / poetry.lock / Cargo.lock / composer.lock / Gemfile.lock 共 5 个 parser，命中时优先于 manifest，`version_resolved=True` | ✅ **已自研补齐（部分）**。yarn.lock/uv.lock 等仍未覆盖；无法确定版本的包现为空串 + 显式标注，不再编造 `"0.0.0"` 送 OSV |
+| **离线漏洞扫描** | `osv_offline.py`：`--download-offline-db` 下载 + `--offline` 只查本地库（`~/.dayv/osv_db/<eco>/`） | ✅ **已自研补齐**。未下载生态的包显性进 `scan_warnings` |
+| **许可证扫描（对白名单）** | `license_policy.py`：`--allowed-licenses` / `--license-categories`（`report`/`health` 均已挂，`--help` 实测） | ✅ **已自研补齐**。UNKNOWN 单列 |
 | **文件系统级组件探测** | 无（SKILL.md 明确禁止扫 `node_modules`/`venv`/`target`） | 🟡 **范围边界**。syft 35 生态的核心能力，dayv 主动不做——需确认是刻意的还是顺手的 |
-| **SBOM 生成（通用）** | 自研 `sbom_generator.py`，仅 SPDX 2.3 JSON | 🔴 **重复造轮子**。syft 35 生态、10 种输出格式、含文件系统级探测；cyclonedx-cli 可跨格式转换 |
-| **SBOM 输出多格式 / 多版本** | 仅 SPDX 2.3 | 🔴 **重复造轮子**。syft 支持 CycloneDX 1.2–1.7 / SPDX 2.2/2.3/3.0 / tag-value / purls |
+| **SBOM 生成（通用）** | 自研 `sbom_generator.py`：SPDX 2.3 + CycloneDX 1.5（均带 purl externalRefs） | 🟡 **差距收窄**。syft 35 生态、10 种输出格式、含文件系统级探测；cyclonedx-cli 可跨格式转换——文件系统级探测仍是 dayv 主动不做的边界 |
+| **SBOM 输出多格式 / 多版本** | SPDX 2.3 + CycloneDX 1.5 两种 | 🟡 **部分覆盖**。syft 支持 CycloneDX 1.2–1.7 / SPDX 2.2/2.3/3.0 / tag-value / purls |
 | **SBOM diff / merge / convert / validate / sign** | 完全没有 | 🔴 **真实缺口，且正是 cyclonedx-cli 的全部核心** |
-| **SBOM ↔ 漏洞结果合流** | 两条链路互不相通 | 🔴 **真实缺口**。osv-scanner 可直接 `-L sbom.cdx.json`；dayv 的 SPDX 生成器**不输出 purl**，因此连这条路都走不通 |
+| **SBOM ↔ 漏洞结果合流** | 生成端 SPDX/CycloneDX 均带 purl externalRefs，可被 osv-scanner/trivy 复扫；分析端 `analyze-data --from-sbom` 可反向消费 SBOM | ✅ **链路已打通**（dayv 自身漏洞结果仍不写回 SBOM 文档） |
 | **SBOM 校验 / 签名 / CI 门禁** | 无 | 🔴 **真实缺口**。`cyclonedx validate --fail-on-errors` / `sign` / `verify` |
 | **dedupe（重复声明）** | 自研 `find_duplicates`（按 name 分组，**版本不敏感**） | 🔴 **重复造轮子**。`cyclonedx analyze --multiple-component-versions` 是版本感知的标准版 |
-| **工具元数据集中登记** | 13 处硬编码（见 [§4.1](#41-现状13-处硬编码)） | 🔴 **真实缺口**。static-analysis 的 data/ 代码分离直接对应这个问题 |
+| **工具元数据集中登记** | 生态元数据已收口到 `ecosystem_registry.py`（单一注册表）；外部工具登记处仍无 | 🟡 **生态侧已补齐**。static-analysis 的 data/ 代码分离对应的外部工具登记处仍是缺口 |
 
 ### 1.3 dayv 现状：真实缺口清单
 
-按修复价值排序。前 3 项是**当前代码里的静默缺陷**，不引入任何外部工具也应该修。
+按修复价值排序。G1–G3 在核实当时是**代码里的静默缺陷**（现已自研修复）；各项现状以本表"证据"列为准，未补的仅剩 **G7**（G4 尚余 build.gradle 等解析路径）。
 
 | # | 缺口 | 证据 | 影响 | 修法（是否需外部工具） |
 | --- | --- | --- | --- | --- |
-| G1 | **健康度「许可证合规」维度恒为常数 75.0** | `health_scorer.py:144-145` 读 `report.get("license_info")`，无值即 `return 75.0`；而 `DependencyAnalyzer.report_to_dict()`（`dependency_analyzer.py:1119-1166`）**从不产出 `license_info`** | 5 维度里权重 0.15 的维度是**占位符不是测量**；且 `for lic in license_info` 期望 list[str]，无调用方提供 | 纯自研：把 registry 已查到的 `license` 透传进 `report_dict` |
-| G2 | **SBOM 的 `LicenseConcluded` 永远是 `NOASSERTION`** | `sbom_generator.py:113,128` 读 `pkg.get("license")`；而 `_to_deps_data()`（`dependency_analyzer.py:1710-1736`）**不产出 `license` 键** | 产出的 SBOM 丢失全部许可证信息，喂给下游工具（含 osv-scanner 的 `--licenses`）等于无效 | 纯自研：`_to_deps_data` 补 `license` |
-| G3 | **用区间/默认值当版本号送进 OSV** | `parse_package_json` `lstrip("^~>=<")`；`parse_pyproject_toml` 缺省 `"0.0.0"` | 漏洞判定系统性失真；`deps_data.json` 由 LLM 手工整理时同样可能带伪版本 | 纯自研（加版本解析与"无法确定"显式标注）或交给 lockfile |
-| G4 | **7 生态只有 3 个 manifest parser** | `parse_dependencies` 的 `parsers` 字典只有 3 项 | `analyze`/`health`/`readme`/`simulate`/`monitor`/`optimize` **6 个子命令**对 maven/crates/rubygems/packagist/nuget 全部不可用，只能退回 `query` | 需外部工具（osv-scanner 19+ lockfile）或自研 4 个 parser |
-| G5 | **无 lockfile 解析** | 全部代码无 lockfile 相关实现 | 无法拿到"实际安装版本"，也就无法做可靠的 SBOM / 漏洞判定 | 需外部工具 |
-| G6 | **SBOM 单格式单版本，且无 purl** | `sbom_generator.py` 固定 `SPDX-2.3`，`pkg_entry` 无 `externalRefs`/purl | 无法被 osv-scanner 当 SBOM 输入；无法参与 SBOM diff | 需外部工具或补 purl |
+| G1 | ✅ **已修复**：健康度「许可证合规」维度不再恒为常数 75.0 | `_collect_license_info()`（`dependency_analyzer.py:1440`）采集 license 回写 DB，`report_to_dict` 产出 `license_info` 键供健康度消费 | 原「权重 0.15 的维度是占位符不是测量」问题消除 | 已自研修复，回归 `tests/test_g1_license_health.py` |
+| G2 | ✅ **已修复**：SBOM `LicenseConcluded` 不再恒为 `NOASSERTION` | `sbom_generator.py:113,130` 读 `pkg.get("license")`，有值即写入；CycloneDX 侧同样落 `licenses[]` | 原「SBOM 丢失全部许可证信息」问题消除 | 已自研修复，回归 `tests/test_g2_sbom_license.py` |
+| G3 | ✅ **已修复**：不再用区间/默认值当版本号送 OSV | 无法确定版本的包 version 为空串并显式标注（`dependency_analyzer.py:116`），禁止编造 `"0.0.0"`（`:1652`）；`_extract_concrete_version` 把范围串归一化为下界 + `version_inferred` 标注 | 原「漏洞判定系统性失真」问题消除 | 已自研修复 + lockfile 优先 |
+| G4 | ✅ **已基本修复**：manifest 解析覆盖 7 生态 | `parse_dependencies` 的 `PARSER_FUNCS` 8 项（`dependency_analyzer.py:3246`，含 5 个 lockfile parser）；另有 `_MINIMAL_PARSERS` 7 项（`:2325`）最小解析 + deps.dev 增强 | 原「6 个子命令对 maven/crates/rubygems/packagist/nuget 全部不可用」已消除；maven/nuget 为最小解析、crates/rubygems/packagist 有 lockfile（`analyze --list-parsers` 自省），build.gradle 等仍无 | 已自研补齐，无需外部工具 |
+| G5 | ✅ **已修复**：lockfile 解析已实现 | package-lock.json (v2/v3) / poetry.lock / Cargo.lock / composer.lock / Gemfile.lock 共 5 个 parser，`version_resolved=True` | 原「无法拿到实际安装版本」问题消除（yarn.lock 等仍未覆盖） | 已自研修复，回归 `tests/test_r4_lockfile_parsers.py` |
+| G6 | ✅ **已修复**：SBOM 双标准且带 purl | `sbom_generator.py` SPDX 2.3 + CycloneDX 1.5（`:231` `CDX_SPEC_VERSION = "1.5"`），均输出 purl externalRefs（`:133-141`） | 原「无法被 osv-scanner 当 SBOM 输入；无法参与 SBOM diff」的输入侧问题消除（diff 侧见 G7） | 已自研修复，回归 `tests/test_r6_cyclonedx.py` / `tests/test_r5_purl.py` |
 | G7 | **无 SBOM diff / merge / convert / validate / sign** | 无对应脚本 | 无法回答"删掉这个依赖到底会带进什么"这类问题 | 需外部工具（cyclonedx-cli） |
-| G8 | **无离线漏洞扫描** | `architecture.md` 异常处理表只有"网络不可用 → 标注离线模式" | 离线/内网场景漏洞维度直接不可用 | 需外部工具（osv-scanner 离线库） |
-| G9 | **无许可证白名单校验** | 无 | 合规场景需人工 | 需外部工具或自研 |
-| G10 | **生态元数据 13 处硬编码** | 见 [§4.1](#41-现状13-处硬编码) | 加一个生态要改 13 个点 | 纯自研重构（registry 化） |
+| G8 | ✅ **已修复**：离线漏洞扫描已实现 | `osv_offline.py`（`--download-offline-db` / `--offline`，库在 `~/.dayv/osv_db/<eco>/`），未下载生态显性进 `scan_warnings` | 原「离线/内网场景漏洞维度直接不可用」问题消除 | 已自研修复，回归 `tests/test_r9_osv_offline.py` |
+| G9 | ✅ **已修复**：许可证白名单校验已实现 | `license_policy.py` 提供 `evaluate_license_policy()` / `classify_license()`；`report` 与 `health` 均挂 `--allowed-licenses` / `--license-categories`（`--help` 实测） | 原「合规场景需人工」问题消除，UNKNOWN 单列 | 已自研修复，回归 `tests/test_r8_license_policy.py` |
+| G10 | ✅ **已修复**：生态元数据已 registry 化 | `ecosystem_registry.py` 单一注册表（文件头声明「新增生态只改这一个文件」），OSV 映射 / 文件检测 / parser 分派 / argparse choices 等全链路跟随 | 原「加一个生态要改 13 个点」问题消除 | 已自研修复（R14），回归 `tests/test_r14_ecosystem_registry.py` |
 
 ---
 
@@ -313,11 +314,11 @@ flowchart TD
 
 对齐 1.6（或 1.5+）的**功能性**理由：
 
-1. **purl 是硬前提，不是可选项**。osv-scanner 扫描 SBOM 输入时明确要求组件带 Package URL。dayv 现有 `sbom_generator` 的 `pkg_entry` 完全没有 `externalRefs`/purl → 即便接上 osv-scanner 也走不通这一条链。purl 同时也是跨工具（syft ↔ cyclonedx-cli ↔ osv-scanner）保持组件身份一致的唯一公共键。
+1. **purl 是硬前提，不是可选项**。osv-scanner 扫描 SBOM 输入时明确要求组件带 Package URL。dayv 的 `sbom_generator` 现已输出 `externalRefs`/purl（核实当时没有，曾因此走不通这条链）。purl 同时也是跨工具（syft ↔ cyclonedx-cli ↔ osv-scanner）保持组件身份一致的唯一公共键。
 2. **diff/merge 需要稳定身份键**。`bom-ref` 的唯一性与稳定性是组件级 diff 的前提；不同生成器（dayv / syft）产出的 bom-ref 策略不同，混用工具做 diff 必须先统一这一层。
 3. **依赖图表达**。CycloneDX 的 `dependencies[]`（ref → dependsOn refs 数组）是 diff "传递可达性"的基础；dayv 现在把 edges 转成 SPDX `Relationships` 的 `DEPENDS_ON`，语义等价但跨格式转换（cyclonedx-cli 的 SPDX interop）会丢细节。
 4. **漏洞可内嵌**。CycloneDX ≥1.4 起有 `vulnerabilities[]`，1.6 进一步加了 `analysis.state` / `justification` / `response` 字段，能把 osv-scanner 的结果直接写回同一份文档，而不是外挂一个 side 文件。dayv 现在是"报告里有漏洞 + 另一个独立 SBOM 文件"，两者无法互相印证。
-5. **许可证要改成数组**。CycloneDX 的 `components[].licenses[]` 支持 `{license: {id|name, ...}}` 或 `{expression: ...}`，能表达复合表达式与多许可证；dayv 现在只有单个字符串 `LicenseConcluded`，且**恒为 `NOASSERTION`**（G2）。
+5. **许可证要改成数组**。CycloneDX 的 `components[].licenses[]` 支持 `{license: {id|name, ...}}` 或 `{expression: ...}`，能表达复合表达式与多许可证；dayv 的 SPDX 侧仍是单个字符串 `LicenseConcluded`（有 license 数据即写真实值，G2 已修复），复合表达式仍表达不了。
 6. **生成器元数据要隔离**。`metadata.tools` 记录"谁生成的"。diff 两份分别由 dayv 和 syft 产出的 BOM 时，工具元数据的差异不能被误报成组件变更。
 7. **SPDX 侧不是出路**。syft 能出 SPDX 3.0，但 cyclonedx-cli 的转换矩阵只到 SPDX 2.3，SPDX 3.0 **不在 SBOM diff 链路上**。
 
@@ -329,7 +330,9 @@ flowchart TD
 
 ### 4.1 现状：13 处硬编码
 
-dayv 没有任何工具/生态元数据登记处，生态信息散落在 5 个文件的 13 个位置：
+> **现状更新（2026-10-04）**：生态元数据已由 `scripts/ecosystem_registry.py`（R14）收口为单一注册表——OSV 映射 / 文件检测 / parser 分派 / argparse choices / SBOM downloadLocation / purl type / deps.dev system 全链路跟随注册表，下表描述的散落状态已成为历史。**外部工具（scanners.yml 式）登记处仍无**，§4.2 起的建议仍然有效。
+
+核实当时（2026-09-30）dayv 没有任何工具/生态元数据登记处，生态信息散落在 5 个文件的 13 个位置：
 
 | # | 位置 | 内容 |
 | --- | --- | --- |

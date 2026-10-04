@@ -1,6 +1,6 @@
 # Core Features 详解
 
-> 依赖分析器 11 个核心功能的详细说明。命令速查见 [subcommands.md](./subcommands.md)。
+> 依赖分析器 13 个核心功能的详细说明。命令速查见 [subcommands.md](./subcommands.md)。
 
 ## 1. 依赖关系图分析
 
@@ -42,7 +42,7 @@
 ## 5. HTML/PDF 报告输出
 
 `report --format html|pdf` 生成可视化报告：
-- **HTML**: 基于 Jinja2 模板，含 5 大章节（项目概览/依赖列表/冲突检测/漏洞检测/版本推荐），表格支持点击表头排序，UTF-8 编码支持中文，自动转义防 XSS
+- **HTML**: 基于 Jinja2 模板，含 6 大章节（项目概览/依赖列表/冲突检测/漏洞检测/许可证合规/版本推荐），表格支持点击表头排序，UTF-8 编码支持中文，自动转义防 XSS
 - **PDF**: 由 HTML 经 weasyprint 转换，需安装 `pip install weasyprint`（系统依赖：`apt install libpango-1.0-0 libpangoft2-1.0-0`）；未安装时显式抛 `RuntimeError` 提示安装，不静默失败
 - **JSON** (默认): 与 `export_report_json` schema 完全一致，向后兼容
 - 复用 `report_renderer.render_report(report_dict, output_path, fmt)` 统一入口

@@ -37,11 +37,11 @@ English | [中文](README.md)
 
 ```bash
 # Sync into the agent skill directories (run from the skills workspace root; the script is not in this repo)
-bash ../scripts/sync-skills.sh dayv   # or the repo-root install-skill.sh
+bash scripts/sync-skills.sh dayv   # or install into a target project: bash scripts/install-skill.sh install dayv
 
-# 首跑前置：安装依赖（缺依赖时子命令会显式报错提示本步骤，不会裸 traceback 崩溃）
+# Prerequisite for the first run: install dependencies (missing dependencies fail with an explicit error pointing to this step, never a bare traceback)
 pip install -r requirements.txt
-# Option 3: Remote install (GitHub repo)
+# Remote install (GitHub repo)
 npx skills add Kirky-X/dayv --agent claude-code -y
 ```
 
@@ -50,17 +50,17 @@ npx skills add Kirky-X/dayv --agent claude-code -y
 ## 🚀 Quick Start
 
 ```bash
-# 分析项目依赖树（输入为 LLM 整理的依赖数据 JSON）
+# Analyze the project dependency tree (input is the LLM-curated dependency-data JSON)
 python scripts/dependency_analyzer.py analyze-data deps_data.json --report -o report.json
 
-# 查询包（实测：fastapi → 0.141.1，versions 列表实时返回）
+# Query a package (measured: fastapi versions returns 20 entries live, latest 0.142.2; latest_version may come back empty — see "known gray zone")
 python scripts/dependency_analyzer.py query fastapi
 python scripts/dependency_analyzer.py query react -e npm
 
-# 安全扫描（先查真实最新版本再查 OSV，拒绝用假版本跑）
+# Security scan (looks up the real latest version before querying OSV; refuses to run on fabricated versions)
 python scripts/dependency_analyzer.py security requests --priority
 
-# HTML 报告 / 健康度 / 优化
+# HTML report / health score / optimization
 python scripts/dependency_analyzer.py report deps_data.json --format html -o report.html
 python scripts/dependency_analyzer.py health /path/to/project
 python scripts/dependency_analyzer.py optimize /path/to/project --check unused
@@ -79,11 +79,11 @@ python scripts/dependency_analyzer.py optimize /path/to/project --check unused
 
 ```
 dayv/
-├── SKILL.md                  # 入口：子命令决策树 + 工作流 + 红线
-├── requirements.txt          # real-ladybug/httpx/jinja2 等
-├── conftest.py               # pytest 配置
+├── SKILL.md                  # entry: subcommand decision tree + workflow + red lines
+├── requirements.txt          # real-ladybug/httpx/jinja2, etc.
+├── conftest.py               # pytest configuration
 ├── tests/                    # offline regression tests (doc-consistency gate included)
-├── references/               # subcommands / architecture / anti-patterns 文档
+├── references/               # subcommands / architecture / anti-patterns docs
 ├── lint-checks.json          # skill_lint self-check rules (cli-subcommands doc gate)
 └── scripts/                  # 29 scripts (single-file, self-contained, pure Python)
     ├── dependency_analyzer.py    # main engine (11 subcommands)

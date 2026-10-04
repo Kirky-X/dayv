@@ -14,7 +14,7 @@
 | 🚫 假设最新版本一定满足所有约束 | 推荐版本与现有依赖冲突 | 推荐前必须 `check_version_constraint` 验证所有约束 |
 | 🚫 静默吞掉解析错误继续跑 | 报告看似完整实则漏掉依赖 | 解析失败必须报错位置 + 行号，让用户决策 |
 | 🚫 把 OSV 无响应当作"无漏洞" | 用户误以为安全 | 必须显式告知"未扫描"，不能默认 success |
-| 🚫 假设 `parse_dependencies` 能解析所有 7 类文件 | Maven/Cargo/Gemfile 等会 `sys.exit(1)` | 检测到未实现 parser 时引导用户改用 `query`/`search` |
+| 🚫 假设 `parse_dependencies` 能完整解析所有 7 类 manifest | Maven/Cargo/Gemfile 等走最小解析，约束是下界近似而非精确版本 | 优先 lockfile（精确版本）；解析能力用 `analyze --list-parsers` 自省 |
 
 ### 范围红线
 

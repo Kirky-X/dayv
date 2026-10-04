@@ -4,24 +4,27 @@
 
 ## 冲突检测结果
 
-`detect_conflicts` 输出，`display_conflicts` 格式化：
+`detect_conflicts` 输出，`display_conflicts` 格式化（`analyze` / `analyze-data` 传 `--conflicts` 时打印）：
 
 ```
-⚠️ Conflict Detected: numpy
-  Required by: pandas>=2.0 (numpy>=1.21), scipy>=1.10 (numpy>=1.23)
-  Conflict type: version_mismatch   Severity: high
-  Suggestion: 统一 numpy 的版本约束
+发现 1 个冲突:
+  包: numpy
+  类型: version_mismatch
+  严重级别: high
+  建议: 统一 numpy 的版本约束（按约束字符串比对，语义等价写法可能误报，请人工确认）
 ```
 
 ## 安全漏洞检测结果
 
-`assess_security` 输出，schema 见 `SecurityVulnerability`：
+`assess_security` 输出，`display_vulnerabilities` 格式化（传 `--security` 时打印），schema 见 `SecurityVulnerability`：
 
 ```
-🔴 Vulnerability: requests@2.25.0
-  CVE ID: CVE-2023-32681   Severity: HIGH
-  Fixed version: 2.31.0
-  Description: Unintended leak of Proxy-Authorization header
+发现 1 个安全漏洞:
+  CVE: CVE-2023-32681
+  包: requests@2.25.0
+  严重级别: high
+  描述: Unintended leak of Proxy-Authorization header
+  修复版本: 2.31.0
 ```
 
 ## deps_data.json schema

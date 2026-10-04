@@ -37,11 +37,11 @@
 
 ```bash
 # 同步到 agent 技能目录（在 skills 工作区根执行，脚本不在本仓内）
-bash ../scripts/sync-skills.sh dayv   # 或用仓库根的 install-skill.sh
+bash scripts/sync-skills.sh dayv   # 或装到指定项目：bash scripts/install-skill.sh install dayv
 
 # 首跑前置：安装依赖（缺依赖时子命令会显式报错提示本步骤，不会裸 traceback 崩溃）
 pip install -r requirements.txt
-# 方式三：远程安装（GitHub 仓库）
+# 远程安装（GitHub 仓库）
 npx skills add Kirky-X/dayv --agent claude-code -y
 ```
 
@@ -53,7 +53,7 @@ npx skills add Kirky-X/dayv --agent claude-code -y
 # 分析项目依赖树（输入为 LLM 整理的依赖数据 JSON）
 python scripts/dependency_analyzer.py analyze-data deps_data.json --report -o report.json
 
-# 查询包（实测：fastapi → 0.141.1，versions 列表实时返回）
+# 查询包（实测：fastapi versions 实时返回 20 条、最新 0.142.2；latest_version 可能为空串，见「已知灰区」）
 python scripts/dependency_analyzer.py query fastapi
 python scripts/dependency_analyzer.py query react -e npm
 

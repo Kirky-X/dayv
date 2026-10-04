@@ -84,7 +84,7 @@ python scripts/dependency_analyzer.py analyze-data --from-sbom sbom.cdx.json --s
 | Rust     | Cargo                | Cargo.toml（最小解析+deps.dev 增强） | Cargo.lock                                        |
 | Ruby     | RubyGems / bundler   | Gemfile（最小解析）               | Gemfile.lock                                         |
 | PHP      | Composer / Packagist | composer.json（最小解析）         | composer.lock                                        |
-| .NET     | NuGet / dotnet CLI   | _.csproj, _.fsproj, \*.vbproj（最小解析） | -                                            |
+| .NET     | NuGet / dotnet CLI   | \*.csproj, \*.fsproj, \*.vbproj（最小解析） | -                                            |
 
 > Go 和 C/C++ 不支持：Go 无中心 registry（走 git modules），C/C++ 无单一中央仓库（vcpkg/conan 分散式）。
 > 命中无完整解析器的 manifest 时自动降级为最小解析 + deps.dev 传递图增强
@@ -173,6 +173,7 @@ flowchart TD
 | dependency_analyzer.py                                                                    | 主分析引擎（11 子命令）          | `main()`                                                 |
 | utils.py                                                                                  | 版本比较/约束检查/HTTP 客户端    | `check_version_constraint` / `compare_versions`          |
 | ecosystem_registry.py                                                                     | 生态元数据单一注册表             | `ECOSYSTEMS` / `parser_status()`                         |
+| base_ecosystem.py                                                                          | 7 生态查询子脚本共享基类（fetch→parse 统一 schema） | `BaseEcosystemAdapter`                            |
 | purl.py                                                                                   | Package URL 单点生成/解析        | `make_purl()` / `parse_purl()`                           |
 | report_renderer.py                                                                        | HTML/PDF/JSON/SARIF 渲染         | `render_report(report, output, fmt)`                     |
 | health_scorer.py                                                                          | 健康度评分                       | `score_health()` / `render_radar_mermaid()`              |
@@ -209,13 +210,7 @@ flowchart TD
 
 ## Integration
 
-| Integrated Skill | Workflow                       |
-| ---------------- | ------------------------------ |
-| build            | 依赖分析 → 版本更新 → 构建     |
-| review           | 依赖冲突 → 安全漏洞 → 代码审查 |
-| security-expert  | 漏洞扫描 → 安全评估 → 修复建议 |
-
-外部工具（osv-scanner / syft / cyclonedx-cli）的能力对标、集成设计与引入决策见 [`references/external-tools-integration.md`](references/external-tools-integration.md)。dayv 当前**未集成任何外部二进制**，全部能力由 `scripts/` 自研实现；产出的 SPDX/CycloneDX/SARIF 均为标准格式，可被 osv-scanner/trivy/GitHub 原生消费。
+dayv 当前**未集成任何外部二进制**，全部能力由 `scripts/` 自研实现；也未与其他 skill 建立集成。外部工具（osv-scanner / syft / cyclonedx-cli）的能力对标、集成设计与引入决策见 [`references/external-tools-integration.md`](references/external-tools-integration.md)；产出的 SPDX/CycloneDX/SARIF 均为标准格式，可被 osv-scanner/trivy/GitHub 原生消费。
 
 ## External Resources
 
@@ -226,6 +221,7 @@ flowchart TD
 - `python -m py_compile scripts/*.py` — 语法检查（29 个脚本全部通过）
 - `python -m pytest tests/ -q` — 回归测试（tests/ 已入 git，clone 后可直接跑）
 - `python3 scripts/skill_lint.py .` — 文档一致性门禁（SKILL.md 子命令表 vs CLI --help，lint-checks.json 声明）
+- 触发词评估集：`triggers/trigger-queries.json`（20 条查询：10 条 `expect=trigger` 正例 + 10 条 `expect=no` 反例，反例标注归属 skill，如 tiangang/diting/pangu）
 - 完整验证步骤见 [`references/architecture.md`](references/architecture.md)
 
 ## Anti-patterns

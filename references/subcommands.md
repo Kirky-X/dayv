@@ -37,16 +37,20 @@ python scripts/dependency_analyzer.py security requests --priority
   # --priority: 按 CVSS × 0.5 + exploit × 0.3 + business × 0.2 加权排序
   # 输出: 优先级排名 + CVE ID + 包名 + 严重度 + 优先级分 + 修复建议
 
-# 生成完整报告（支持 4 种格式，输入是 deps_data.json 而非项目路径）
+# 生成完整报告（支持 6 种格式，输入是 deps_data.json 而非项目路径）
 python scripts/dependency_analyzer.py report deps_data.json --format json -o report.json
 python scripts/dependency_analyzer.py report deps_data.json --format html -o report.html
 python scripts/dependency_analyzer.py report deps_data.json --format pdf  -o report.pdf
+python scripts/dependency_analyzer.py report deps_data.json --format sarif -o report.sarif.json
+python scripts/dependency_analyzer.py report deps_data.json --format cyclonedx -o bom.cdx.json
 python scripts/dependency_analyzer.py report deps_data.json --format sbom -o project-sbom.spdx.json
   # deps_data.json schema 见 subcommands-examples.md（version 会经 _extract_concrete_version
   # 归一化：范围串取下界标 version_inferred，伪版本/通配置空并显式报告，不送 OSV）
   # --format json (默认): 与 export_report_json schema 一致的 JSON 报告
   # --format html: 含可排序表格的 HTML 报告（支持中文，防 XSS）
   # --format pdf:  HTML 转 PDF（依赖 weasyprint，未安装时显式报错）
+  # --format sarif: SARIF 2.1.0（GitHub Security 页直连）
+  # --format cyclonedx: CycloneDX 1.5 JSON
   # --format sbom: SPDX 2.3 JSON 格式的软件物料清单
 
 # 评估项目依赖健康度（5 维度评分 + 雷达图 + 改进建议）
@@ -119,7 +123,7 @@ flowchart TD
     ANALYZE --> IMPACT["--impact 冲突影响分析"]
     SECURITY --> SIM["simulate 升级模拟"]
     SECURITY --> MON["monitor 持续监控"]
-    REPORT --> OUT["json/html/pdf/sbom 输出"]
+    REPORT --> OUT["json/html/pdf/sarif/cyclonedx/sbom 输出"]
 ```
 
 ## 新增能力（v0.1.1，对标调研 15 条建议落地）
