@@ -17,7 +17,11 @@
         每个实际子命令以反引号形式出现在 doc 中，且 doc 的子命令表（行首
         | `cmd` | 形态）不列出不存在的命令——文档与 CLI 行为一致性门禁。
   WARN  frontmatter metadata 缺失（agentskills 规范）；SKILL.md >500 行；
-        scripts/ 有可执行脚本但无 tests/；references 孤儿文件；LICENSE 缺失。
+        scripts/ 有可执行脚本但无 tests/；references 孤儿文件；LICENSE 缺失；
+        非链接的散文路径 token（如 `ui/home.md`）在三处均未命中：
+        源文件相对 / 仓根相对 / references/ 根相对（多为上游项目文件或
+        示例产物路径）；已由仓 lint-checks.json external_paths 声明的
+        前缀不再告警。
 
 退出码: 0=无 FAIL（WARN 不阻断）; 1=存在 FAIL。
 
@@ -30,7 +34,11 @@ lint-checks.json（仓根，可选）schema:
     {"name": "资产文件头三要素", "type": "file-header",
      "dirs": ["references/commands", "references/templates"],
      "fields": ["来源", "许可", "核验日期"]}                # fields 缺省即三要素
-  ]}
+   ],
+   "external_paths": ["docs/", "research/"]}               # 可选。声明这些前缀开头、
+                                                            # 仓内不存在的散文路径 token
+                                                            # 为上游/示例产物引用，跳过告警；
+                                                            # 对 markdown 链接（FAIL 级）无效
 """
 
 from __future__ import annotations
@@ -75,12 +83,15 @@ def strip_code(text: str) -> str:
     return CODE_FENCE_RE.sub("", text)
 
 
-def check_links(repo: Path) -> tuple[list[str], list[str]]:
+def check_links(repo: Path, external_paths: list[str]) -> tuple[list[str], list[str]]:
     """返回 (fail 列表, warn 列表)。
 
     FAIL 只针对仓库内资产：markdown 链接目标、references//scripts//tests/ 开头的路径。
     其余带斜杠的 .md（如上游项目文件、示例产物路径）降为 WARN。
     裸文件名（design.md、ATTACK-CLASSES.md）属散文提及，不做判定。
+    散文路径 token（非 markdown 链接）按书写惯例放宽：源文件相对未命中时，
+    依次回退 仓根相对 与 references/ 根相对——书写惯例如此，目标真实存在
+    即非断链；仍不命中且未被 external_paths 声明的才告警。
     """
     fails: list[str] = []
     warns: list[str] = []
@@ -89,6 +100,13 @@ def check_links(repo: Path) -> tuple[list[str], list[str]]:
     def resolve(src: Path, raw: str) -> bool:
         # markdown 渲染器按源文件相对解析链接：src 在仓根时等价于仓根相对
         return (src.parent / raw).is_file()
+
+    def resolve_prose(raw: str) -> bool:
+        # 散文 token 的回退解析；markdown 链接不适用（渲染器语义必须严格源文件相对）
+        return (repo / raw).is_file() or (repo / "references" / raw).is_file()
+
+    def declared_external(raw: str) -> bool:
+        return any(raw.startswith(p) for p in external_paths)
 
     def escapes(raw: str) -> bool:
         """跨仓/外部仓引用（../ 开头，或解析后落在仓外）——仓内无法校验。"""
@@ -122,7 +140,12 @@ def check_links(repo: Path) -> tuple[list[str], list[str]]:
             (warns if escapes(raw) else fails).append(f"{key[0]} -> {raw}")
         for raw in sorted(other):
             key = (str(src.relative_to(repo)), raw)
-            if key in seen or resolve(src, raw):
+            if (
+                key in seen
+                or resolve(src, raw)
+                or resolve_prose(raw)
+                or declared_external(raw)
+            ):
                 continue
             seen.add(key)
             warns.append(f"{key[0]} -> {raw}")
@@ -172,11 +195,18 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
         return [f"{name}: lint-checks.json 非法 JSON: {exc}"], warns
     if (
         not isinstance(cfg, dict)
-        or set(cfg) != {"checks"}
-        or not isinstance(cfg["checks"], list)
+        or set(cfg) - {"checks", "external_paths"}
+        or not isinstance(cfg.get("checks", []), list)
     ):
-        return [f'{name}: lint-checks.json 顶层必须是 {{"checks": [...]}} 映射'], warns
-    for i, rule in enumerate(cfg["checks"], 1):
+        return [
+            f'{name}: lint-checks.json 顶层必须是 {{"checks": [...], "external_paths": [...]}} 的子集映射'
+        ], warns
+    external = cfg.get("external_paths", [])
+    if not isinstance(external, list) or any(
+        not isinstance(x, str) or not x for x in external
+    ):
+        return [f"{name}: lint-checks.json external_paths 必须是非空字符串列表"], warns
+    for i, rule in enumerate(cfg.get("checks", []), 1):
         where = f"lint-checks.json checks[{i}]"
         if not isinstance(rule, dict):
             fails.append(f"{name}: {where} 不是对象")
@@ -433,7 +463,17 @@ def lint_repo(repo: Path) -> tuple[list[str], list[str]]:
             f"{name}: SKILL.md {lines} 行，超过 {MAX_SKILLMD_LINES} 行建议上限"
         )
 
-    link_fails, link_warns = check_links(repo)
+    external_paths: list[str] = []
+    cfg_path = repo / "lint-checks.json"
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict) and isinstance(cfg.get("external_paths"), list):
+                external_paths = [str(x) for x in cfg["external_paths"]]
+        except Exception:
+            pass  # 配置非法由 check_repo_rules 显性报 FAIL，此处不静默吞
+
+    link_fails, link_warns = check_links(repo, external_paths)
     for miss in link_fails:
         fails.append(f"{name}: 引用不存在的仓库内文档 {miss}")
     if link_warns:
