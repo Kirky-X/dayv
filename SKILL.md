@@ -1,6 +1,6 @@
 ---
 name: dayv
-description: "依赖分析引擎（PyPI/npm/Maven 等 7 生态系统）。分析依赖树/冲突/漏洞，生成 HTML/PDF/SBOM/健康度，或优化依赖配置（去重/删冗余/识别未使用）。触发：dependency、依赖树、版本冲突、安全漏洞、package.json、pyproject.toml、Cargo.toml、SBOM、健康度、优化依赖"
+description: "依赖分析引擎（PyPI/npm/Maven 等 7 生态系统）。分析依赖树/冲突/漏洞，生成 HTML/PDF/SBOM/健康度，或优化依赖配置（去重/删冗余/识别未使用）。触发：dependency、依赖树、版本冲突、安全漏洞、package.json、pyproject.toml、Cargo.toml、SBOM、健康度、优化依赖。边界：整仓代码 SAST 与密钥扫描→tiangang（本 skill 的 OSV 只做依赖维度的漏洞分析与治理）；项目初始化期的依赖护栏配置→pangu"
 argument-hint: "<analyze-data|analyze|query|search|security|report|health|readme|simulate|monitor|optimize> [options]"
 license: MIT
 metadata:
@@ -210,7 +210,7 @@ flowchart TD
 
 ## Integration
 
-dayv 当前**未集成任何外部二进制**，全部能力由 `scripts/` 自研实现；也未与其他 skill 建立集成。外部工具（osv-scanner / syft / cyclonedx-cli）的能力对标、集成设计与引入决策见 [`references/external-tools-integration.md`](references/external-tools-integration.md)；产出的 SPDX/CycloneDX/SARIF 均为标准格式，可被 osv-scanner/trivy/GitHub 原生消费。
+dayv 当前**未集成任何外部二进制**，全部能力由 `scripts/` 自研实现；与 tiangang/pangu 为任务级分工（见 description 边界），无工具级集成。外部工具（osv-scanner / syft / cyclonedx-cli）的能力对标、集成设计与引入决策见 [`references/external-tools-integration.md`](references/external-tools-integration.md)；产出的 SPDX/CycloneDX/SARIF 均为标准格式，可被 osv-scanner/trivy/GitHub 原生消费。
 
 ## External Resources
 
