@@ -12,10 +12,16 @@
         frontmatter metadata 与 skill.json version 一致；
         SKILL.md 与 references/**/*.md 中引用的 .md 路径存在；
         可选 lint-checks.json 声明的仓内自检规则未满足（require-pattern /
-        file-header / cli-subcommands 三类，按仓 opt-in；配置本身非法同样
-        FAIL）。cli-subcommands：运行 cli 的 --help 取实际子命令集合，断言
-        每个实际子命令以反引号形式出现在 doc 中，且 doc 的子命令表（行首
-        | `cmd` | 形态）不列出不存在的命令——文档与 CLI 行为一致性门禁。
+        file-header / cli-subcommands / forbid-pattern / count-matches 五类，
+        按仓 opt-in；配置本身非法同样 FAIL）。cli-subcommands：运行 cli 的
+        --help 取实际子命令集合，断言每个实际子命令以反引号形式出现在 doc
+        中，且 doc 的子命令表（行首 | `cmd` | 形态）不列出不存在的命令——
+        文档与 CLI 行为一致性门禁。forbid-pattern：对 files 逐行匹配
+        pattern，命中即发现（ignore 正则可豁免行），用于公开文案禁用语表。
+        count-matches：数 source 文件（可限 section 标题节）里符合
+        row_pattern 的行数为**唯一事实**，与 claim_files 中 claim_pattern(s)
+        抓到的数字对账——公开计数漂移门禁（机制来源: styleseed
+        test-public-claims.mjs, 2026-10 吸收）。
   WARN  frontmatter metadata 缺失（agentskills 规范）；SKILL.md >500 行；
         scripts/ 有可执行脚本但无 tests/；references 孤儿文件；LICENSE 缺失；
         非链接的散文路径 token（如 `ui/home.md`）在三处均未命中：
@@ -33,7 +39,19 @@ lint-checks.json（仓根，可选）schema:
      "severity": "FAIL"},                                  # 缺省 FAIL，可 WARN
     {"name": "资产文件头三要素", "type": "file-header",
      "dirs": ["references/commands", "references/templates"],
-     "fields": ["来源", "许可", "核验日期"]}                # fields 缺省即三要素
+     "fields": ["来源", "许可", "核验日期"]},                # fields 缺省即三要素
+    {"name": "设计语言计数对账", "type": "count-matches",
+     "source": "references/templates/INDEX.md",             # 唯一来源
+     "section": "## 设计语言",                              # 可选:只数该标题节
+     "row_pattern": "^\\|\\s*\\[",                         # 可选:一"条"一行(默认表行)
+     "claim_files": ["SKILL.md", "README.md"],
+     "claim_patterns": ["(\\d+)\\s*种设计语言"],            # 每式恰好一个捕获组
+     "min_claims": 1,                                       # 可选:防"抓不到=白检"
+     "severity": "WARN"},
+    {"name": "禁用语表", "type": "forbid-pattern",
+     "files": ["README.md", "SKILL.md"], "pattern": "完美|革命性",
+     "ignore": "<豁免行正则>",                              # 可选
+     "severity": "FAIL"}
    ],
    "external_paths": ["docs/", "research/"]}               # 可选。声明这些前缀开头、
                                                             # 仓内不存在的散文路径 token
@@ -81,6 +99,30 @@ FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 
 def strip_code(text: str) -> str:
     return CODE_FENCE_RE.sub("", text)
+
+
+def section_slice(text: str, section: str | None) -> str:
+    """截取 `section` 标题行到下一个同级（或更高级）标题之间的文本。
+
+    count-matches 用：唯一来源是「INDEX 的设计语言表」而不是整个文件时，
+    只数该节内的行。section 未命中抛 ValueError（配置写错必须显性化）。
+    """
+    if not section:
+        return text
+    m = re.match(r"^(#+)\s", section)
+    level = len(m.group(1)) if m else 6
+    stop_re = re.compile(r"^#{1,%d}\s" % level)
+    lines = text.splitlines(keepends=True)
+    start = None
+    for i, line in enumerate(lines):
+        if start is None and line.startswith(section):
+            start = i
+            continue
+        if start is not None and stop_re.match(line):
+            return "".join(lines[start:i])
+    if start is None:
+        raise ValueError(f"section 未命中: {section!r}")
+    return "".join(lines[start:])
 
 
 def check_links(repo: Path, external_paths: list[str]) -> tuple[list[str], list[str]]:
@@ -222,12 +264,22 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
             "severity",
             "cli",
             "doc",
+            "source",
+            "section",
+            "row_pattern",
+            "claim_files",
+            "claim_pattern",
+            "claim_patterns",
+            "min_claims",
+            "files",
+            "ignore",
         }
         if unknown:
             fails.append(f"{name}: {where} 未知键: {sorted(unknown)}")
             continue
         rtype = rule.get("type", "require-pattern")
-        if rtype not in ("require-pattern", "file-header", "cli-subcommands"):
+        if rtype not in ("require-pattern", "file-header", "cli-subcommands",
+                         "forbid-pattern", "count-matches"):
             fails.append(f"{name}: {where} 未知 type: {rtype!r}")
             continue
         sev = rule.get("severity", "FAIL")
@@ -318,6 +370,103 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                 bucket.append(
                     f"{name}: {rname} {doc_rel} 子命令表列出不存在的命令: {extra}"
                 )
+        elif rtype == "count-matches":
+            # 公开计数对账：source 里的条目数 = 唯一事实，claim 文件里手写的数字必须一致
+            source_rel = rule.get("source")
+            claim_files = rule.get("claim_files")
+            patterns: list[str] = []
+            if isinstance(rule.get("claim_pattern"), str):
+                patterns.append(rule["claim_pattern"])
+            if isinstance(rule.get("claim_patterns"), list):
+                patterns.extend(p for p in rule["claim_patterns"] if isinstance(p, str))
+            if not source_rel or not isinstance(claim_files, list) or not claim_files or not patterns:
+                fails.append(
+                    f"{name}: {where} count-matches 需要 source / claim_files / claim_pattern(s)"
+                )
+                continue
+            source_path = repo / source_rel
+            if not source_path.is_file():
+                fails.append(f"{name}: {where} 目标文件不存在: {source_rel}")
+                continue
+            absent = [rel for rel in claim_files if not (repo / rel).is_file()]
+            if absent:
+                fails.append(f"{name}: {where} claim_files 不存在: {absent}")
+                continue
+            min_claims = rule.get("min_claims", 1)
+            if not isinstance(min_claims, int) or min_claims < 0:
+                fails.append(f"{name}: {where} min_claims 必须为 ≥0 整数")
+                continue
+            try:
+                expected = len(
+                    re.compile(rule.get("row_pattern", r"^\|\s*\["), re.MULTILINE).findall(
+                        section_slice(
+                            source_path.read_text(encoding="utf-8", errors="replace"),
+                            rule.get("section"),
+                        )
+                    )
+                )
+                regexes = []
+                for pat in patterns:
+                    rep = re.compile(pat)
+                    if rep.groups != 1:
+                        raise ValueError(f"claim_pattern 必须恰好一个捕获组: {pat!r}")
+                    regexes.append(rep)
+            except (ValueError, re.error) as exc:
+                fails.append(f"{name}: {where} count-matches 配置非法: {exc}")
+                continue
+            seen = 0
+            mismatches: list[str] = []
+            for rel in claim_files:
+                claim_text = (repo / rel).read_text(encoding="utf-8", errors="replace")
+                for rep in regexes:
+                    for m in rep.finditer(claim_text):
+                        seen += 1
+                        if int(m.group(1)) != expected:
+                            line = claim_text.count("\n", 0, m.start()) + 1
+                            mismatches.append(
+                                f"{rel}:{line} 声称 {m.group(1)}；唯源 {source_rel} 是 {expected}"
+                            )
+            bucket = fails if sev == "FAIL" else warns
+            if mismatches:
+                bucket.append(
+                    f"{name}: {rname} 计数漂移: {'；'.join(mismatches[:5])}"
+                )
+            if seen < min_claims:
+                bucket.append(
+                    f"{name}: {rname} 未抓到任何计数声明（规则形同虚设，"
+                    f"min_claims={min_claims}；检查 claim_files/claim_patterns 是否对准公开声明）"
+                )
+        elif rtype == "forbid-pattern":
+            # 禁用语表：files 里逐行匹配 pattern，命中即发现（ignore 行级豁免）
+            pattern = rule.get("pattern")
+            files = rule.get("files")
+            if not isinstance(files, list) and isinstance(rule.get("file"), str):
+                files = [rule["file"]]
+            if not isinstance(files, list) or not files or not pattern:
+                fails.append(f"{name}: {where} forbid-pattern 需要 files 与 pattern")
+                continue
+            absent = [rel for rel in files if not (repo / rel).is_file()]
+            if absent:
+                fails.append(f"{name}: {where} 目标文件不存在: {absent}")
+                continue
+            try:
+                regex = re.compile(pattern)
+                ignore = re.compile(rule["ignore"]) if rule.get("ignore") else None
+            except re.error as exc:
+                fails.append(f"{name}: {where} 非法正则: {exc}")
+                continue
+            hits: list[str] = []
+            for rel in files:
+                text = (repo / rel).read_text(encoding="utf-8", errors="replace")
+                for line_no, line in enumerate(text.splitlines(), 1):
+                    if ignore and ignore.search(line):
+                        continue
+                    m = regex.search(line)
+                    if m:
+                        hits.append(f"{rel}:{line_no} 命中 {m.group(0)!r}")
+            if hits:
+                bucket = fails if sev == "FAIL" else warns
+                bucket.append(f"{name}: {rname} 命中禁用表述: {'；'.join(hits[:5])}")
         else:  # file-header
             dirs, fields = (
                 rule.get("dirs"),
