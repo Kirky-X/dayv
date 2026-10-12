@@ -111,7 +111,7 @@ def section_slice(text: str, section: str | None) -> str:
         return text
     m = re.match(r"^(#+)\s", section)
     level = len(m.group(1)) if m else 6
-    stop_re = re.compile(r"^#{1,%d}\s" % level)
+    stop_re = re.compile(rf"^#{{1,{level}}}\s")
     lines = text.splitlines(keepends=True)
     start = None
     for i, line in enumerate(lines):
@@ -279,8 +279,14 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
             fails.append(f"{name}: {where} 未知键: {sorted(unknown)}")
             continue
         rtype = rule.get("type", "require-pattern")
-        if rtype not in ("require-pattern", "file-header", "cli-subcommands",
-                         "forbid-pattern", "count-matches", "sibling-skills"):
+        if rtype not in (
+            "require-pattern",
+            "file-header",
+            "cli-subcommands",
+            "forbid-pattern",
+            "count-matches",
+            "sibling-skills",
+        ):
             fails.append(f"{name}: {where} 未知 type: {rtype!r}")
             continue
         sev = rule.get("severity", "FAIL")
@@ -292,17 +298,27 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
             # #8:SKILL.md description 引用的兄弟 skill 必须存在(词边界匹配;
             # 未引用的兄弟不检查;无 frontmatter 描述则本规则 no-op)。
             siblings = rule.get("siblings")
-            if not isinstance(siblings, list) or not siblings or not all(
-                isinstance(x, str) and x for x in siblings
+            if (
+                not isinstance(siblings, list)
+                or not siblings
+                or not all(isinstance(x, str) and x for x in siblings)
             ):
-                fails.append(f"{name}: {where} sibling-skills 需要非空 siblings 字符串列表(缺 siblings 键即配置错误)")
+                fails.append(
+                    f"{name}: {where} sibling-skills 需要非空 siblings 字符串列表(缺 siblings 键即配置错误)"
+                )
                 continue
             desc = ""
             skillmd = repo / "SKILL.md"
             if skillmd.is_file():
-                fm = re.match(r"^---\n(.*?)\n---", skillmd.read_text(encoding="utf-8"), re.S)
+                fm = re.match(
+                    r"^---\n(.*?)\n---", skillmd.read_text(encoding="utf-8"), re.DOTALL
+                )
                 if fm:
-                    dm = re.search(r"description:\s*[\"']?(.*?)[\"']?\s*$", fm.group(1), re.M)
+                    dm = re.search(
+                        r"description:\s*[\"']?(.*?)[\"']?\s*$",
+                        fm.group(1),
+                        re.MULTILINE,
+                    )
                     if dm:
                         desc = dm.group(1)
             for sib in siblings:
@@ -405,7 +421,12 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                 patterns.append(rule["claim_pattern"])
             if isinstance(rule.get("claim_patterns"), list):
                 patterns.extend(p for p in rule["claim_patterns"] if isinstance(p, str))
-            if not source_rel or not isinstance(claim_files, list) or not claim_files or not patterns:
+            if (
+                not source_rel
+                or not isinstance(claim_files, list)
+                or not claim_files
+                or not patterns
+            ):
                 fails.append(
                     f"{name}: {where} count-matches 需要 source / claim_files / claim_pattern(s)"
                 )
@@ -424,7 +445,9 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                 continue
             try:
                 expected = len(
-                    re.compile(rule.get("row_pattern", r"^\|\s*\["), re.MULTILINE).findall(
+                    re.compile(
+                        rule.get("row_pattern", r"^\|\s*\["), re.MULTILINE
+                    ).findall(
                         section_slice(
                             source_path.read_text(encoding="utf-8", errors="replace"),
                             rule.get("section"),
@@ -454,9 +477,7 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
                             )
             bucket = fails if sev == "FAIL" else warns
             if mismatches:
-                bucket.append(
-                    f"{name}: {rname} 计数漂移: {'；'.join(mismatches[:5])}"
-                )
+                bucket.append(f"{name}: {rname} 计数漂移: {'；'.join(mismatches[:5])}")
             if seen < min_claims:
                 bucket.append(
                     f"{name}: {rname} 未抓到任何计数声明（规则形同虚设，"
