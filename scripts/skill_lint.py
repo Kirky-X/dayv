@@ -273,18 +273,44 @@ def check_repo_rules(repo: Path) -> tuple[list[str], list[str]]:
             "min_claims",
             "files",
             "ignore",
+            "siblings",
         }
         if unknown:
             fails.append(f"{name}: {where} 未知键: {sorted(unknown)}")
             continue
         rtype = rule.get("type", "require-pattern")
         if rtype not in ("require-pattern", "file-header", "cli-subcommands",
-                         "forbid-pattern", "count-matches"):
+                         "forbid-pattern", "count-matches", "sibling-skills"):
             fails.append(f"{name}: {where} 未知 type: {rtype!r}")
             continue
         sev = rule.get("severity", "FAIL")
         if sev not in ("FAIL", "WARN"):
             fails.append(f"{name}: {where} severity 只能是 FAIL/WARN")
+            continue
+        rname = str(rule.get("name") or where)
+        if rtype == "sibling-skills":
+            # #8:SKILL.md description 引用的兄弟 skill 必须存在(词边界匹配;
+            # 未引用的兄弟不检查;无 frontmatter 描述则本规则 no-op)。
+            siblings = rule.get("siblings")
+            if not isinstance(siblings, list) or not siblings or not all(
+                isinstance(x, str) and x for x in siblings
+            ):
+                fails.append(f"{name}: {where} sibling-skills 需要非空 siblings 字符串列表(缺 siblings 键即配置错误)")
+                continue
+            desc = ""
+            skillmd = repo / "SKILL.md"
+            if skillmd.is_file():
+                fm = re.match(r"^---\n(.*?)\n---", skillmd.read_text(encoding="utf-8"), re.S)
+                if fm:
+                    dm = re.search(r"description:\s*[\"']?(.*?)[\"']?\s*$", fm.group(1), re.M)
+                    if dm:
+                        desc = dm.group(1)
+            for sib in siblings:
+                if not re.search(r"(?<![\w-])" + re.escape(sib) + r"(?![\w-])", desc):
+                    continue  # 未引用的兄弟不检查
+                if not (repo.parent / sib / "SKILL.md").is_file():
+                    msg = f"{name}: 悬空兄弟引用: description 提到 {sib},但 {sib}/SKILL.md 不存在"
+                    (warns if sev == "WARN" else fails).append(msg)
             continue
         rname = str(rule.get("name") or where)
         if rtype == "require-pattern":
