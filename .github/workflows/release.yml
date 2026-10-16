@@ -36,12 +36,25 @@ jobs:
           echo "packed ${OUT}"
           ls -lh "$OUT"
 
+      # semver 预发布段（-rc.N 等）→ GitHub prerelease 标记；rc 不得抢占 Latest
+      - name: Derive prerelease flag
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "PRERELEASE=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PRERELEASE=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 幂等：softprops 对同 tag 已有 release 为 upsert 语义（重跑改写而非新建），
+      # 随后 uniqueness 断言钉住恰好 1 个。
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2（SHA 钉版）
         with:
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          prerelease: ${{ steps.meta.outputs.PRERELEASE }}
           files: ${{ github.event.repository.name }}.skill
 
       - name: Verify release uniqueness (idempotency guard)
